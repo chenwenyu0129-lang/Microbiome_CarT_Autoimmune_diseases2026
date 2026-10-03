@@ -3,7 +3,7 @@
 
 ## Overview
 
-This repository contains selected R and Python workflows for longitudinal microbiome and single-cell analyses in a clinical study. The scripts cover microbial diversity, community composition, outcome-associated bacterial features, host–microbiome relationships, metagenomic functions, and B-cell transcriptional profiles.
+This repository contains R and Python workflows for longitudinal microbiome and single-cell analyses in a clinical study. The scripts cover microbial diversity, community composition, outcome-associated bacterial features, host–microbiome relationships, metagenomic functions, and B-cell transcriptional profiles.
 
 The workflows are organized around analysis questions and figure outputs rather than as a single end-to-end pipeline. Each R Markdown script documents its settings, reads its required inputs, and exports analysis-specific results. The single-cell notebook contains downstream analyses of a processed, annotated AnnData object, including cell-type visualization, marker expression, trajectory analysis, cell-composition PCA, and functional enrichment.
 
