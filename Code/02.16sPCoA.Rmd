@@ -1,0 +1,301 @@
+---
+title: "Species-level CLR-PCA of longitudinal full-length 16S profiles"
+output:
+  html_document:
+    toc: true
+    number_sections: true
+knit: (function(inputFile, encoding) { rmarkdown::render(inputFile, encoding = encoding, output_dir = tools::file_path_sans_ext(basename(inputFile))) })
+---
+
+This analysis applies a centered log-ratio transformation followed by principal
+component analysis to species-level full-length 16S profiles. Selected
+longitudinal time groups are visualized with group-specific colors, confidence
+ellipses, and consistent coordinate ranges.
+
+```{r setup, message=FALSE, warning=FALSE}
+required_packages <- c("factoextra", "ggplot2", "ggpubr")
+missing_packages <- required_packages[
+  !vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)
+]
+if (length(missing_packages) > 0L) {
+  stop(
+    "Install the following R packages before running this analysis: ",
+    paste(missing_packages, collapse = ", ")
+  )
+}
+
+input_file <- "000.input16S.Rds"
+analysis_name <- "02.16sPCoA"
+output_root <- analysis_name
+figure_dir <- file.path(output_root, "figures")
+
+dir.create(output_root, recursive = TRUE, showWarnings = FALSE)
+dir.create(figure_dir, recursive = TRUE, showWarnings = FALSE)
+
+# Keep all automatically generated R Markdown figures under the same output
+# directory as the explicitly saved PDF files.
+knitr::opts_chunk$set(
+  fig.path = file.path(output_root, "knitr_figures", "")
+)
+
+group_levels <- c(
+  "001_BL", "002_D0", "003_D14", "004_M1",
+  "005_M2", "006_M3", "009_M6"
+)
+
+group_colors <- c(
+  "001_BL" = "#969696",
+  "002_D0" = "#feb24c",
+  "003_D14" = "#ff0000",
+  "004_M1" = "#7fc97f",
+  "005_M2" = "#beaed4",
+  "006_M3" = "#007A87",
+  "009_M6" = "#c51b8a"
+)
+```
+
+# 1. Read and align the de-identified input
+
+The abundance matrix already uses `Sample_Name` as its column names. Only the
+sample name and longitudinal group are required for this analysis; the unused
+metadata join and coefficient-of-variation calculation from the exploratory
+script have therefore been removed.
+
+```{r prepare-input}
+if (!file.exists(input_file)) {
+  stop("Input file not found: ", input_file)
+}
+
+input16S <- readRDS(input_file)
+if (!is.list(input16S) || !all(c("dat_rela", "metainfo") %in% names(input16S))) {
+  stop("000.input16S.Rds must contain dat_rela and metainfo.")
+}
+
+dat_rela <- input16S$dat_rela
+metainfo <- input16S$metainfo
+
+required_metadata <- c("Sample_Name", "timeIDcontiue")
+missing_metadata <- setdiff(required_metadata, names(metainfo))
+if (length(missing_metadata) > 0L) {
+  stop("metainfo is missing required column(s): ", paste(missing_metadata, collapse = ", "))
+}
+
+if (!identical(colnames(dat_rela), as.character(metainfo$Sample_Name))) {
+  stop("dat_rela columns are not aligned with metainfo$Sample_Name.")
+}
+if (anyDuplicated(metainfo$Sample_Name) || anyDuplicated(colnames(dat_rela))) {
+  stop("Sample_Name must be unique in both dat_rela and metainfo.")
+}
+
+keep_samples <- metainfo$timeIDcontiue %in% group_levels
+metainfo_select <- metainfo[keep_samples, c("Sample_Name", "timeIDcontiue"), drop = FALSE]
+metainfo_select$timeIDcontiue <- as.character(metainfo_select$timeIDcontiue)
+
+dat_rela_select <- dat_rela[, metainfo_select$Sample_Name, drop = FALSE]
+dat_rela_select <- dat_rela_select[rowSums(dat_rela_select) > 0, , drop = FALSE]
+
+stopifnot(
+  ncol(dat_rela_select) == nrow(metainfo_select),
+  identical(colnames(dat_rela_select), as.character(metainfo_select$Sample_Name)),
+  !anyNA(metainfo_select$timeIDcontiue)
+)
+
+data.frame(
+  time_group = group_levels,
+  n_samples = as.integer(
+    table(factor(metainfo_select$timeIDcontiue, levels = group_levels))
+  )
+)
+```
+
+# 2. CLR transformation and PCA
+
+A pseudocount of `1e-6` is added before applying the centered log-ratio (CLR)
+transformation independently to each sample. PCA is then performed on samples,
+with centering enabled and scaling disabled.
+
+```{r clr-pca}
+pseudo <- 1e-6
+
+dat_clr <- apply(
+  dat_rela_select + pseudo,
+  2,
+  function(x) log(x) - mean(log(x))
+)
+
+pcs <- stats::prcomp(
+  t(dat_clr),
+  center = TRUE,
+  scale. = FALSE
+)
+```
+
+# 3. PCA of all selected longitudinal groups
+
+The full plot retains the original seven-color palette and 95% confidence
+ellipses. The output dimensions remain 4.96 by 3.71 inches.
+
+```{r all-groups-pca, fig.width=4.96, fig.height=3.71, message=FALSE, warning=FALSE}
+p_all <- factoextra::fviz_pca_ind(
+  pcs,
+  geom = "point",
+  col.ind = metainfo_select$timeIDcontiue,
+  palette = unname(group_colors),
+  addEllipses = TRUE,
+  ellipse.type = "confidence",
+  ellipse.level = 0.95,
+  legend.title = "Groups",
+  repel = TRUE
+) +
+  ggplot2::theme_bw(12) +
+  ggplot2::theme(
+    aspect.ratio = 1,
+    legend.title = ggplot2::element_blank(),
+    plot.title = ggplot2::element_blank(),
+    axis.text = ggplot2::element_text(family = "ArialMT"),
+    axis.title = ggplot2::element_text(family = "ArialMT"),
+    panel.grid = ggplot2::element_blank(),
+    panel.border = ggplot2::element_rect(fill = NA, colour = "grey87")
+  )
+
+all_groups_pdf <- file.path(
+  figure_dir,
+  "species_clr_pca_all_timepoints.pdf"
+)
+
+ggplot2::ggsave(
+  all_groups_pdf,
+  p_all,
+  width = 4.96,
+  height = 3.71,
+  device = "pdf"
+)
+
+p_all
+```
+
+# 4. Baseline-versus-timepoint PCA panels
+
+All pairwise panels use the PCA scores calculated from the complete selected
+dataset. They therefore share one coordinate system. As in the original code,
+the lower x-axis limit is fixed at -80, points use shape 21, and the group
+ellipses use a 68% t-distribution level.
+
+```{r pairwise-functions}
+df_all <- p_all$data
+df_all$timeIDcontiue <- df_all$Col.
+
+# Use the same global coordinate limits for all six panels.
+x_range <- range(df_all$x, na.rm = TRUE)
+x_range[1] <- -80
+y_range <- range(df_all$y, na.rm = TRUE)
+
+pair_levels <- c(
+  "002_D0", "003_D14", "004_M1",
+  "005_M2", "006_M3", "009_M6"
+)
+
+plot_pair_from_all_pca <- function(timepoint) {
+  pair_data <- subset(
+    df_all,
+    timeIDcontiue %in% c("001_BL", timepoint)
+  )
+  pair_data$group_pair <- ifelse(
+    pair_data$timeIDcontiue == "001_BL",
+    "001_BL",
+    timepoint
+  )
+
+  ggplot2::ggplot(
+    pair_data,
+    ggplot2::aes(x = x, y = y, fill = group_pair)
+  ) +
+    ggplot2::geom_point(
+      shape = 21,
+      color = "black",
+      size = 1,
+      stroke = 0.3
+    ) +
+    ggplot2::stat_ellipse(
+      ggplot2::aes(color = group_pair),
+      type = "t",
+      level = 0.68,
+      linewidth = 0.5,
+      show.legend = FALSE
+    ) +
+    ggplot2::geom_vline(xintercept = 0, linetype = "dashed") +
+    ggplot2::geom_hline(yintercept = 0, linetype = "dashed") +
+    ggplot2::scale_fill_manual(values = group_colors) +
+    ggplot2::scale_color_manual(values = group_colors) +
+    ggplot2::coord_cartesian(
+      xlim = x_range,
+      ylim = y_range,
+      expand = FALSE
+    ) +
+    ggplot2::theme_bw(12) +
+    ggplot2::theme(
+      aspect.ratio = 1,
+      legend.position = "none",
+      legend.title = ggplot2::element_blank(),
+      axis.title = ggplot2::element_blank(),
+      plot.title = ggplot2::element_text(hjust = 0.5),
+      panel.grid = ggplot2::element_blank(),
+      panel.border = ggplot2::element_rect(fill = NA, colour = "grey87")
+    )
+}
+
+pair_plots <- lapply(pair_levels, plot_pair_from_all_pca)
+names(pair_plots) <- paste0("baseline_vs_", sub("^\\d+_", "", tolower(pair_levels)))
+```
+
+```{r save-individual-pairwise-pdfs, message=FALSE, warning=FALSE}
+for (plot_name in names(pair_plots)) {
+  output_file <- file.path(
+    figure_dir,
+    paste0("species_clr_pca_", plot_name, ".pdf")
+  )
+
+  ggplot2::ggsave(
+    output_file,
+    pair_plots[[plot_name]],
+    width = 5.5,
+    height = 5.5,
+    device = "pdf"
+  )
+}
+```
+
+# 5. Combined six-panel figure
+
+```{r combined-pairwise-panels, fig.width=7.44, fig.height=5.565, message=FALSE, warning=FALSE}
+p_combined <- ggpubr::ggarrange(
+  pair_plots[["baseline_vs_d0"]],
+  pair_plots[["baseline_vs_d14"]],
+  pair_plots[["baseline_vs_m1"]],
+  pair_plots[["baseline_vs_m2"]],
+  pair_plots[["baseline_vs_m3"]],
+  pair_plots[["baseline_vs_m6"]],
+  align = "hv"
+)
+
+combined_pdf <- file.path(
+  figure_dir,
+  "species_clr_pca_baseline_pairwise_panels.pdf"
+)
+
+ggplot2::ggsave(
+  combined_pdf,
+  p_combined,
+  width = 4.96 * 1.5,
+  height = 3.71 * 1.5,
+  device = "pdf"
+)
+
+p_combined
+```
+
+# 6. Reproducibility record
+
+```{r session-info}
+sessionInfo()
+```

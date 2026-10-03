@@ -1,0 +1,615 @@
+---
+title: "Bacterial score-clinical indicator correlation network"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+    code_folding: show
+---
+
+This analysis calculates a bacterial response score for each 16S sample using a
+fixed baseline model, matches the scores to longitudinal clinical indicators by
+patient-cycle identifier and timepoint, evaluates Spearman correlations, and
+displays significant pooled and time-specific associations in a circular
+network.
+
+# 1. Analysis settings
+
+```{r setup, message=FALSE, warning=FALSE}
+rm(list = ls())
+
+try(Sys.setlocale("LC_CTYPE", "en_US.UTF-8"), silent = TRUE)
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(openxlsx)
+  library(ggplot2)
+})
+
+set.seed(20260712)
+
+input_file <- "000.input16S.Rds"
+model_file <- file.path(
+  "07.outcomeM1_AUC",
+  "02_B_cell_reconstitution_associated_score_model",
+  "M0_bacteria_ResponseM1_score_model.rds"
+)
+clinical_file <- "000.clinical_indicators_deidentified.xlsx"
+
+analysis_name <- "008.bacteriaScoreClinicalCorrelation"
+output_dir <- analysis_name
+figure_dir <- file.path(output_dir, "figures")
+dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(figure_dir, recursive = TRUE, showWarnings = FALSE)
+
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.align = "center",
+  fig.path = file.path(output_dir, "knitr_figures", "")
+)
+
+network_time_levels <- c("BL", "D0", "D14", "M1", "M2", "M3", "M4", "M5", "M6")
+pooled_fdr_threshold <- 0.10
+timepoint_p_threshold <- 0.05
+minimum_timepoint_n <- 8
+```
+
+# 2. Input data and bacterial scores
+
+```{r read-inputs-and-score}
+input_16s <- readRDS(input_file)
+if (!all(c("dat_rela", "metainfo") %in% names(input_16s))) {
+  stop("000.input16S.Rds must contain dat_rela and metainfo.")
+}
+
+dat_rela <- input_16s$dat_rela
+metainfo <- input_16s$metainfo
+
+required_metadata <- c(
+  "Patient_ID", "CART_Cycle_ID", "Sample_Name", "Timepoint"
+)
+missing_metadata <- setdiff(required_metadata, colnames(metainfo))
+if (length(missing_metadata) > 0L) {
+  stop("Missing metadata columns: ", paste(missing_metadata, collapse = ", "))
+}
+
+model_information <- readRDS(model_file)
+if (is.null(model_information$model)) {
+  stop("The model RDS does not contain a fitted model.")
+}
+
+bacteria_model <- model_information$model
+bacteria_pseudocount <- model_information$bacteria_pseudocount_M0
+if (is.null(bacteria_pseudocount)) {
+  bacteria_pseudocount <- model_information$bacteria_pseudo_M0
+}
+if (is.null(bacteria_pseudocount) || !is.finite(bacteria_pseudocount)) {
+  stop("The model RDS does not contain a valid M0 bacterial pseudocount.")
+}
+
+as_numeric_matrix <- function(x) {
+  x <- as.matrix(x)
+  storage.mode(x) <- "numeric"
+  x
+}
+
+predict_score <- function(model, new_x) {
+  missing_features <- setdiff(model$features, colnames(new_x))
+  if (length(missing_features) > 0L) {
+    missing_matrix <- matrix(
+      NA_real_,
+      nrow = nrow(new_x),
+      ncol = length(missing_features),
+      dimnames = list(rownames(new_x), missing_features)
+    )
+    new_x <- cbind(new_x, missing_matrix)
+  }
+
+  new_x <- new_x[, model$features, drop = FALSE]
+  new_z <- sweep(sweep(new_x, 2, model$center, "-"), 2, model$spread, "/")
+  score <- rowMeans(sweep(new_z, 2, model$direction, "*"), na.rm = TRUE)
+  score[!is.finite(score)] <- NA_real_
+  score
+}
+
+score_metadata <- metainfo %>%
+  mutate(
+    Patient_ID = as.character(Patient_ID),
+    CART_Cycle_ID = as.character(CART_Cycle_ID),
+    Sample_Name = as.character(Sample_Name),
+    time_label = as.character(Timepoint),
+    patient_cycle_id = paste(Patient_ID, CART_Cycle_ID, sep = "_")
+  ) %>%
+  filter(time_label %in% network_time_levels)
+
+if (anyDuplicated(score_metadata$Sample_Name)) {
+  stop("Sample_Name must uniquely identify rows in metainfo.")
+}
+
+has_bacteria <- score_metadata$Sample_Name %in% colnames(dat_rela)
+bacteria_score <- rep(NA_real_, nrow(score_metadata))
+
+available_features <- intersect(bacteria_model$features, rownames(dat_rela))
+if (length(available_features) == 0L) {
+  stop("None of the model features are present in dat_rela.")
+}
+
+if (any(has_bacteria)) {
+  bacteria_raw <- t(as_numeric_matrix(dat_rela[
+    available_features,
+    score_metadata$Sample_Name[has_bacteria],
+    drop = FALSE
+  ]))
+  colnames(bacteria_raw) <- available_features
+  bacteria_x <- log10(bacteria_raw + bacteria_pseudocount)
+  bacteria_score[has_bacteria] <- predict_score(bacteria_model, bacteria_x)
+}
+
+score_values <- score_metadata %>%
+  transmute(
+    patient_cycle_id,
+    time_label,
+    Sample_Name,
+    bacteria_score = bacteria_score,
+    has_bacteria_score = !is.na(bacteria_score)
+  )
+
+sample_counts <- score_values %>%
+  group_by(time_label) %>%
+  summarise(
+    n_sample = n(),
+    n_bacteria_score = sum(has_bacteria_score),
+    .groups = "drop"
+  ) %>%
+  mutate(time_label = factor(time_label, levels = network_time_levels)) %>%
+  arrange(time_label) %>%
+  mutate(time_label = as.character(time_label))
+
+sample_counts
+```
+
+# 3. Clinical indicators
+
+```{r read-clinical-indicators}
+read_clinical_sheet_long <- function(file, sheet) {
+  clinical_sheet <- openxlsx::read.xlsx(
+    file,
+    sheet = sheet,
+    colNames = FALSE,
+    check.names = FALSE
+  )
+
+  if (nrow(clinical_sheet) < 2L || ncol(clinical_sheet) < 2L) {
+    return(data.frame())
+  }
+
+  patient_cycle_ids <- as.character(unlist(clinical_sheet[1, -1]))
+  time_labels <- as.character(unlist(clinical_sheet[-1, 1]))
+  value_matrix <- clinical_sheet[-1, -1, drop = FALSE]
+  colnames(value_matrix) <- patient_cycle_ids
+
+  clinical_rows <- lapply(seq_along(patient_cycle_ids), function(column_index) {
+    data.frame(
+      clinical_variable = sheet,
+      patient_cycle_id = patient_cycle_ids[column_index],
+      time_label = time_labels,
+      clinical_value = suppressWarnings(as.numeric(unlist(value_matrix[, column_index]))),
+      stringsAsFactors = FALSE
+    )
+  })
+
+  do.call(rbind, clinical_rows)
+}
+
+clinical_sheets <- openxlsx::getSheetNames(clinical_file)
+if (length(clinical_sheets) == 0L) {
+  stop("No clinical indicator sheets were found.")
+}
+
+clinical_long <- bind_rows(lapply(
+  clinical_sheets,
+  function(sheet_name) read_clinical_sheet_long(clinical_file, sheet_name)
+)) %>%
+  mutate(
+    patient_cycle_id = as.character(patient_cycle_id),
+    time_label = as.character(time_label)
+  ) %>%
+  filter(
+    !is.na(patient_cycle_id),
+    patient_cycle_id != "",
+    time_label %in% network_time_levels,
+    !is.na(clinical_value)
+  )
+
+score_clinical_matched <- score_values %>%
+  filter(!is.na(bacteria_score)) %>%
+  inner_join(
+    clinical_long,
+    by = c("patient_cycle_id", "time_label"),
+    relationship = "many-to-many"
+  )
+
+data.frame(
+  clinical_indicator_count = length(unique(clinical_long$clinical_variable)),
+  matched_rows = nrow(score_clinical_matched),
+  matched_patient_cycles = length(unique(score_clinical_matched$patient_cycle_id))
+)
+```
+
+# 4. Spearman correlations
+
+```{r correlation-analysis}
+safe_spearman <- function(data, x_column, y_column) {
+  data <- data[!is.na(data[[x_column]]) & !is.na(data[[y_column]]), ]
+  if (
+    nrow(data) < 4L ||
+    length(unique(data[[x_column]])) < 2L ||
+    length(unique(data[[y_column]])) < 2L
+  ) {
+    return(data.frame(n = nrow(data), rho = NA_real_, P_value = NA_real_))
+  }
+
+  correlation_test <- suppressWarnings(cor.test(
+    data[[x_column]],
+    data[[y_column]],
+    method = "spearman",
+    exact = FALSE
+  ))
+
+  data.frame(
+    n = nrow(data),
+    rho = unname(correlation_test$estimate),
+    P_value = correlation_test$p.value
+  )
+}
+
+correlation_pooled <- bind_rows(lapply(
+  split(score_clinical_matched, score_clinical_matched$clinical_variable),
+  function(data_i) {
+    result <- safe_spearman(data_i, "bacteria_score", "clinical_value")
+    data.frame(
+      analysis = "all_timepoints_pooled",
+      score_type = "bacteria",
+      clinical_variable = unique(data_i$clinical_variable)[1],
+      time_label = "ALL",
+      result,
+      stringsAsFactors = FALSE
+    )
+  }
+))
+
+correlation_by_time <- bind_rows(lapply(
+  split(
+    score_clinical_matched,
+    interaction(
+      score_clinical_matched$clinical_variable,
+      score_clinical_matched$time_label,
+      drop = TRUE
+    )
+  ),
+  function(data_i) {
+    result <- safe_spearman(data_i, "bacteria_score", "clinical_value")
+    data.frame(
+      analysis = "by_timepoint",
+      score_type = "bacteria",
+      clinical_variable = unique(data_i$clinical_variable)[1],
+      time_label = unique(data_i$time_label)[1],
+      result,
+      stringsAsFactors = FALSE
+    )
+  }
+))
+
+correlation_results <- bind_rows(correlation_pooled, correlation_by_time) %>%
+  group_by(analysis) %>%
+  mutate(FDR_global = p.adjust(P_value, method = "BH")) %>%
+  ungroup() %>%
+  group_by(analysis, score_type) %>%
+  mutate(FDR_within_score = p.adjust(P_value, method = "BH")) %>%
+  ungroup() %>%
+  arrange(analysis, P_value)
+
+safe_plot_label <- function(x) {
+  x_utf8 <- enc2utf8(as.character(x))
+  x_utf8[x_utf8 == "铁蛋白"] <- "Ferritin"
+  label <- iconv(x_utf8, from = "UTF-8", to = "ASCII//TRANSLIT", sub = "_")
+  label <- gsub("_+", "_", label)
+  label <- gsub("^_|_$", "", label)
+  ifelse(is.na(label) | label == "", "non_ascii_indicator", label)
+}
+
+network_edges_pooled <- correlation_results %>%
+  filter(
+    analysis == "all_timepoints_pooled",
+    !is.na(FDR_global),
+    FDR_global < pooled_fdr_threshold
+  ) %>%
+  mutate(
+    clinical_variable_label = safe_plot_label(clinical_variable),
+    edge_sign = ifelse(rho >= 0, "positive", "negative"),
+    edge_label = sprintf(
+      "rho=%.2f; P=%.3g; FDR=%.3g",
+      rho,
+      P_value,
+      FDR_global
+    )
+  ) %>%
+  arrange(desc(abs(rho)))
+
+network_edges_by_time <- correlation_results %>%
+  filter(
+    analysis == "by_timepoint",
+    !is.na(P_value),
+    P_value < timepoint_p_threshold,
+    n >= minimum_timepoint_n
+  ) %>%
+  mutate(
+    clinical_variable_label = safe_plot_label(clinical_variable),
+    edge_sign = ifelse(rho >= 0, "positive", "negative"),
+    score_time_node = paste(score_type, time_label, sep = "_"),
+    edge_label = sprintf("rho=%.2f; P=%.3g; n=%s", rho, P_value, n)
+  ) %>%
+  arrange(P_value)
+
+circular_network_edges <- bind_rows(
+  network_edges_pooled %>%
+    mutate(
+      source_node = "BacteiraOvellALL",
+      source_type = "Overall",
+      network_level = "overall_FDR_global_lt_0.10",
+      source_time = "ALL"
+    ),
+  network_edges_by_time %>%
+    mutate(
+      source_node = paste0("Bacteria_", time_label),
+      source_type = "Timepoint",
+      network_level = "timepoint_raw_P_lt_0.05_n_ge_8",
+      source_time = time_label
+    )
+) %>%
+  transmute(
+    source_node,
+    target_node = clinical_variable_label,
+    source_type,
+    network_level,
+    source_time,
+    clinical_variable,
+    clinical_variable_label,
+    time_label,
+    n,
+    rho,
+    P_value,
+    FDR_global,
+    FDR_within_score,
+    edge_sign,
+    edge_label
+  ) %>%
+  arrange(source_type, source_time, P_value)
+
+data.frame(
+  pooled_edges = nrow(network_edges_pooled),
+  timepoint_edges = nrow(network_edges_by_time),
+  total_edges = nrow(circular_network_edges)
+)
+```
+
+# 5. Save analysis tables
+
+```{r save-analysis-tables}
+write_csv_utf8 <- function(data, file_name) {
+  utils::write.csv(
+    data,
+    file.path(output_dir, file_name),
+    row.names = FALSE,
+    fileEncoding = "UTF-8"
+  )
+}
+
+analysis_notes <- data.frame(
+  item = c(
+    "random_seed",
+    "bacteria_model",
+    "clinical_input",
+    "score_transformation",
+    "clinical_matching",
+    "correlation_method",
+    "pooled_edge_threshold",
+    "timepoint_edge_threshold",
+    "pooled_correlation_caution"
+  ),
+  description = c(
+    "20260712",
+    model_file,
+    clinical_file,
+    "log10(relative abundance + M0 pseudocount), followed by fixed M0 centering, scaling, and feature directions",
+    "Patient-cycle identifier and timepoint",
+    "Spearman correlation with exact = FALSE",
+    "BH FDR_global < 0.10",
+    "Raw P < 0.05 and n >= 8",
+    "Pooled rows are exploratory because repeated measurements from the same patient-cycle are not independent."
+  ),
+  stringsAsFactors = FALSE
+)
+
+write_csv_utf8(analysis_notes, "00_analysis_notes.csv")
+write_csv_utf8(score_values, "01_bacteria_scores.csv")
+write_csv_utf8(sample_counts, "02_sample_counts.csv")
+write_csv_utf8(clinical_long, "03_clinical_indicators_long.csv")
+write_csv_utf8(score_clinical_matched, "04_score_clinical_matched_long.csv")
+write_csv_utf8(correlation_results, "05_spearman_correlations.csv")
+write_csv_utf8(circular_network_edges, "06_circular_network_edges.csv")
+```
+
+# 6. Circular correlation network
+
+```{r circular-network, fig.width=10.2, fig.height=8.4}
+plot_bacteria_circular_network <- function(edges) {
+  if (nrow(edges) == 0L) {
+    stop("No edges passed the specified network thresholds.")
+  }
+
+  source_nodes <- edges %>%
+    distinct(node = source_node) %>%
+    mutate(node_type = "Bacteria score")
+
+  clinical_nodes <- edges %>%
+    distinct(node = target_node) %>%
+    mutate(node_type = "Clinical indicator")
+
+  node_degree <- c(edges$source_node, edges$target_node) %>%
+    table() %>%
+    as.data.frame(stringsAsFactors = FALSE)
+  colnames(node_degree) <- c("node", "degree")
+  node_degree$degree <- as.numeric(node_degree$degree)
+
+  source_order <- source_nodes %>%
+    mutate(
+      source_rank = case_when(
+        node == "BacteiraOvellALL" ~ 0,
+        TRUE ~ match(sub("^Bacteria_", "", node), network_time_levels)
+      )
+    ) %>%
+    arrange(source_rank) %>%
+    pull(node)
+
+  clinical_order <- edges %>%
+    group_by(target_node) %>%
+    summarise(
+      degree = n(),
+      min_p = min(P_value, na.rm = TRUE),
+      max_abs_rho = max(abs(rho), na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    mutate(
+      min_p = ifelse(is.finite(min_p), min_p, Inf),
+      max_abs_rho = ifelse(is.finite(max_abs_rho), max_abs_rho, 0)
+    ) %>%
+    arrange(desc(degree), min_p, desc(max_abs_rho)) %>%
+    pull(target_node)
+
+  node_order <- c(source_order, clinical_order)
+  node_plot <- bind_rows(source_nodes, clinical_nodes) %>%
+    distinct(node, .keep_all = TRUE) %>%
+    left_join(node_degree, by = "node") %>%
+    mutate(
+      degree = ifelse(is.na(degree), 0, degree),
+      node = factor(node, levels = node_order),
+      node_index = as.numeric(node),
+      angle = pi / 2 - 2 * pi * (node_index - 1) / length(node_order),
+      x = cos(angle),
+      y = sin(angle),
+      label_x = 1.16 * cos(angle),
+      label_y = 1.16 * sin(angle),
+      label_hjust = ifelse(label_x > 0.02, 0, ifelse(label_x < -0.02, 1, 0.5)),
+      label_vjust = ifelse(label_y > 0.92, 0, ifelse(label_y < -0.92, 1, 0.5))
+    )
+
+  edge_plot <- edges %>%
+    left_join(
+      node_plot %>% dplyr::select(source_node = node, x_source = x, y_source = y),
+      by = "source_node"
+    ) %>%
+    left_join(
+      node_plot %>% dplyr::select(target_node = node, x_target = x, y_target = y),
+      by = "target_node"
+    ) %>%
+    mutate(
+      abs_rho = abs(rho),
+      edge_sign = ifelse(rho >= 0, "positive", "negative"),
+      edge_alpha = ifelse(source_type == "Overall", 0.90, 0.58)
+    )
+
+  ggplot() +
+    geom_segment(
+      data = edge_plot,
+      aes(
+        x = x_source,
+        y = y_source,
+        xend = x_target,
+        yend = y_target,
+        color = edge_sign,
+        linewidth = abs_rho,
+        alpha = edge_alpha
+      ),
+      lineend = "round"
+    ) +
+    geom_point(
+      data = node_plot,
+      aes(x = x, y = y, size = degree, fill = node_type),
+      shape = 21,
+      color = "grey20",
+      stroke = 0.45
+    ) +
+    geom_text(
+      data = node_plot,
+      aes(
+        x = label_x,
+        y = label_y,
+        label = as.character(node),
+        hjust = label_hjust,
+        vjust = label_vjust
+      ),
+      size = 3.2,
+      lineheight = 0.95
+    ) +
+    scale_color_manual(
+      values = c(positive = "#B2182B", negative = "#2166AC"),
+      name = "Correlation"
+    ) +
+    scale_fill_manual(
+      values = c("Bacteria score" = "#FDE68A", "Clinical indicator" = "#DBEAFE"),
+      name = "Node"
+    ) +
+    scale_size_continuous(range = c(3.8, 12), name = "Degree") +
+    scale_linewidth(range = c(0.35, 1.9), name = "abs(rho)") +
+    scale_alpha_identity() +
+    coord_equal(
+      xlim = c(-1.45, 1.45),
+      ylim = c(-1.35, 1.35),
+      clip = "off"
+    ) +
+    theme_void(base_size = 11) +
+    theme(
+      legend.position = "right",
+      legend.box = "vertical",
+      plot.margin = margin(16, 24, 16, 24),
+      plot.title = element_text(face = "bold", hjust = 0.5),
+      plot.subtitle = element_text(hjust = 0.5)
+    ) +
+    guides(
+      fill = guide_legend(order = 1),
+      size = guide_legend(order = 2),
+      linewidth = guide_legend(order = 3),
+      color = guide_legend(order = 4)
+    ) +
+    labs(
+      title = "Bacteria score-clinical correlation circular network",
+      subtitle = paste0(
+        "BacteiraOvellALL: pooled bacteria correlations with FDR<0.10; ",
+        "Bacteria_time: timepoint correlations with raw P<0.05 and n>=8"
+      )
+    )
+}
+
+circular_network_plot <- plot_bacteria_circular_network(circular_network_edges)
+print(circular_network_plot)
+
+ggsave(
+  file.path(
+    figure_dir,
+    "Figure_10_bacteria_score_clinical_correlation_circular_network.pdf"
+  ),
+  circular_network_plot,
+  width = 10.2,
+  height = 8.4
+)
+```
+
+# 7. Session information
+
+```{r session-information}
+sessionInfo()
+```

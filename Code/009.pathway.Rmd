@@ -1,0 +1,915 @@
+---
+title: "Metagenomic pathway and KO functional analysis"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+    code_folding: show
+    self_contained: true
+---
+
+This workflow evaluates longitudinal changes in metagenomic pathway and KEGG
+ortholog abundance, performs pathway-level differential analysis and gene set
+enrichment analysis, and compares KO enrichment patterns between clinical
+outcome groups at each sampling timepoint.
+
+```{r setup, include=FALSE}
+options(stringsAsFactors = FALSE)
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tidyr)
+  library(tibble)
+  library(ggplot2)
+  library(limma)
+  library(ComplexHeatmap)
+  library(circlize)
+  library(clusterProfiler)
+  library(enrichplot)
+  library(openxlsx)
+})
+
+input_file <- "000.input16S.Rds"
+pathway_file <- file.path("009.pathway", "000.pathabundance.deidentified.Rds")
+ko_file <- file.path("009.pathway", "000.KO_unstratified.deidentified.Rds")
+kegg_file <- file.path("009.pathway", "000.KEGG_KO_pathway_annotation.Rds")
+
+analysis_name <- "009.pathway"
+output_dir <- analysis_name
+figure_dir <- file.path(output_dir, "figures")
+table_dir <- file.path(output_dir, "tables")
+outcome_dir <- file.path(output_dir, "outcome_KO_GSEA")
+
+dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(figure_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(table_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(outcome_dir, recursive = TRUE, showWarnings = FALSE)
+
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.align = "center",
+  fig.path = file.path(output_dir, "knitr_figures", "")
+)
+
+time_levels <- c(
+  "001_BL", "002_D0", "003_D14", "004_M1",
+  "005_M2", "006_M3", "009_M6"
+)
+comparison_names <- c(
+  "D0_vs_BL", "D14_vs_BL", "M1_vs_BL",
+  "M2_vs_BL", "M3_vs_BL", "M6_vs_BL"
+)
+pseudo_count <- 1e-6
+prevalence_fraction <- 0.20
+```
+
+# Input preparation
+
+```{r read-inputs}
+required_files <- c(input_file, pathway_file, ko_file, kegg_file)
+missing_files <- required_files[!file.exists(required_files)]
+if (length(missing_files) > 0L) {
+  stop("Missing input file(s): ", paste(missing_files, collapse = ", "))
+}
+
+input16S <- readRDS(input_file)
+if (!is.list(input16S) || !all(c("dat_rela", "metainfo") %in% names(input16S))) {
+  stop("000.input16S.Rds must contain dat_rela and metainfo.")
+}
+
+metainfo <- input16S$metainfo
+required_metadata <- c("Sample_Name", "timeIDcontiue", "outcome_M1", "outcome_M3")
+missing_metadata <- setdiff(required_metadata, names(metainfo))
+if (length(missing_metadata) > 0L) {
+  stop("Missing metadata column(s): ", paste(missing_metadata, collapse = ", "))
+}
+if (anyDuplicated(metainfo$Sample_Name)) {
+  stop("metainfo$Sample_Name must be unique.")
+}
+
+pathway_raw <- as.matrix(readRDS(pathway_file))
+ko_raw <- as.matrix(readRDS(ko_file))
+storage.mode(pathway_raw) <- "numeric"
+storage.mode(ko_raw) <- "numeric"
+
+if (anyDuplicated(colnames(pathway_raw)) || anyDuplicated(colnames(ko_raw))) {
+  stop("The abundance matrices contain duplicated Sample_Name columns.")
+}
+if (!all(colnames(pathway_raw) %in% metainfo$Sample_Name) ||
+    !all(colnames(ko_raw) %in% metainfo$Sample_Name)) {
+  stop("Every abundance column must match metainfo$Sample_Name.")
+}
+
+metadata_for <- function(sample_names, allowed_times = time_levels) {
+  ans <- metainfo[match(sample_names, metainfo$Sample_Name), , drop = FALSE]
+  keep <- !is.na(ans$timeIDcontiue) & ans$timeIDcontiue %in% allowed_times
+  ans <- ans[keep, , drop = FALSE]
+  rownames(ans) <- ans$Sample_Name
+  ans
+}
+
+to_cpm <- function(x) {
+  totals <- colSums(x, na.rm = TRUE)
+  if (any(!is.finite(totals) | totals <= 0)) {
+    stop("All retained samples must have a positive finite library total.")
+  }
+  sweep(x, 2, totals, "/") * 1e6
+}
+
+fit_time_contrasts <- function(y, metadata) {
+  metadata <- metadata[colnames(y), , drop = FALSE]
+  group <- factor(metadata$timeIDcontiue, levels = time_levels)
+  design <- model.matrix(~ 0 + group)
+  colnames(design) <- make.names(time_levels)
+
+  fit <- eBayes(lmFit(y, design), trend = TRUE)
+  contrast_matrix <- makeContrasts(
+    D0_vs_BL  = X002_D0  - X001_BL,
+    D14_vs_BL = X003_D14 - X001_BL,
+    M1_vs_BL  = X004_M1  - X001_BL,
+    M2_vs_BL  = X005_M2  - X001_BL,
+    M3_vs_BL  = X006_M3  - X001_BL,
+    M6_vs_BL  = X009_M6  - X001_BL,
+    levels = design
+  )
+  fit2 <- eBayes(contrasts.fit(fit, contrast_matrix), trend = TRUE)
+
+  results <- lapply(comparison_names, function(comparison) {
+    tab <- topTable(
+      fit2, coef = comparison, n = Inf,
+      adjust.method = "BH", sort.by = "P"
+    )
+    tab$feature <- rownames(tab)
+    tab$type <- comparison
+    rownames(tab) <- NULL
+    tab
+  })
+  names(results) <- comparison_names
+  results
+}
+```
+
+# Longitudinal pathway analysis
+
+```{r pathway-differential-analysis}
+pathway_metadata <- metadata_for(colnames(pathway_raw))
+pathway_dat <- pathway_raw[, rownames(pathway_metadata), drop = FALSE]
+pathway_dat <- pathway_dat[
+  !grepl("UNMAPPED|UNINTEGRATED|unclassified", rownames(pathway_dat), ignore.case = TRUE) &
+    !grepl("g__", rownames(pathway_dat)),
+  , drop = FALSE
+]
+pathway_dat <- pathway_dat[rowSums(pathway_dat > 0) > ncol(pathway_dat) * prevalence_fraction, , drop = FALSE]
+pathway_cpm <- to_cpm(pathway_dat)
+pathway_clr <- apply(
+  pathway_cpm + pseudo_count,
+  2,
+  function(x) log(x) - mean(log(x))
+)
+
+pathway_results <- fit_time_contrasts(pathway_clr, pathway_metadata)
+pathway_results_long <- bind_rows(pathway_results)
+pathway_results_long <- pathway_results_long %>%
+  rename(pathway = feature)
+
+saveRDS(
+  list(
+    differential_results = pathway_results,
+    cpm = pathway_cpm,
+    metadata = pathway_metadata[, c("Sample_Name", "timeIDcontiue"), drop = FALSE]
+  ),
+  file.path(table_dir, "longitudinal_pathway_limma_results.rds")
+)
+write.csv(
+  pathway_results_long,
+  file.path(table_dir, "longitudinal_pathway_limma_results.csv"),
+  row.names = FALSE
+)
+
+pathway_sample_counts <- pathway_metadata %>%
+  count(timeIDcontiue, name = "sample_count")
+write.csv(
+  pathway_sample_counts,
+  file.path(table_dir, "longitudinal_pathway_sample_counts.csv"),
+  row.names = FALSE
+)
+
+knitr::kable(pathway_sample_counts)
+```
+
+## Combined abundance and differential heatmaps
+
+```{r pathway-heatmaps}
+raw_p_rank <- pathway_results_long %>%
+  filter(P.Value < 0.05) %>%
+  count(pathway, name = "raw_p_count") %>%
+  arrange(desc(raw_p_count)) %>%
+  pull(pathway)
+
+adjusted_significant <- pathway_results_long %>%
+  filter(adj.P.Val < 0.05) %>%
+  pull(pathway) %>%
+  unique()
+
+recurrent_raw_p <- pathway_results_long %>%
+  filter(P.Value < 0.05) %>%
+  count(pathway) %>%
+  filter(n > 3) %>%
+  pull(pathway)
+
+selected_pathways <- raw_p_rank[
+  raw_p_rank %in% union(adjusted_significant, recurrent_raw_p)
+]
+if (length(selected_pathways) == 0L) {
+  stop("No pathway met the heatmap selection criteria.")
+}
+
+top15_pathways <- head(selected_pathways, 15)
+remaining_pathways <- if (length(selected_pathways) > 15) {
+  selected_pathways[-seq_len(15)]
+} else {
+  selected_pathways
+}
+
+get_star <- function(p) {
+  ifelse(
+    is.na(p), "",
+    ifelse(
+      p < 0.001, "***",
+      ifelse(p < 0.01, "**", ifelse(p < 0.05, "*", ifelse(p < 0.1, ".", "")))
+    )
+  )
+}
+
+draw_pathway_heatmap <- function(selected, filename, height) {
+  abundance <- pathway_cpm[selected, rownames(pathway_metadata), drop = FALSE]
+  abundance_scaled <- t(scale(t(log2(abundance + 1))))
+  abundance_scaled[!is.finite(abundance_scaled)] <- 0
+
+  differential_subset <- pathway_results_long %>%
+    filter(pathway %in% selected)
+
+  logfc_mat <- differential_subset %>%
+    select(pathway, type, logFC) %>%
+    pivot_wider(names_from = type, values_from = logFC, values_fill = 0) %>%
+    column_to_rownames("pathway") %>%
+    as.matrix()
+  logfc_mat <- logfc_mat[selected, comparison_names, drop = FALSE]
+
+  pval_mat <- differential_subset %>%
+    select(pathway, type, P.Value) %>%
+    pivot_wider(names_from = type, values_from = P.Value, values_fill = 1) %>%
+    column_to_rownames("pathway") %>%
+    as.matrix()
+  pval_mat <- pval_mat[selected, comparison_names, drop = FALSE]
+
+  padj_mat <- differential_subset %>%
+    select(pathway, type, adj.P.Val) %>%
+    pivot_wider(names_from = type, values_from = adj.P.Val, values_fill = 1) %>%
+    column_to_rownames("pathway") %>%
+    as.matrix()
+  padj_mat <- padj_mat[selected, comparison_names, drop = FALSE]
+  star_mat <- matrix(get_star(pval_mat), nrow = nrow(pval_mat), dimnames = dimnames(pval_mat))
+
+  group_info <- factor(pathway_metadata$timeIDcontiue, levels = time_levels)
+  group_colors <- c(
+    "001_BL" = "#F2E778", "002_D0" = "#F5B183", "003_D14" = "#E99568",
+    "004_M1" = "#EC83C3", "005_M2" = "#F3D768", "006_M3" = "#82DFC6",
+    "009_M6" = "#E77AE2"
+  )
+  top_annotation <- HeatmapAnnotation(
+    Group = group_info,
+    col = list(Group = group_colors)
+  )
+
+  max_logfc <- max(abs(logfc_mat), na.rm = TRUE)
+  if (!is.finite(max_logfc) || max_logfc == 0) max_logfc <- 1
+
+  ht_abundance <- Heatmap(
+    abundance_scaled,
+    name = "Z-score",
+    col = colorRamp2(c(-2, 0, 2), c("#3182BD", "white", "#D73027")),
+    top_annotation = top_annotation,
+    column_split = group_info,
+    column_gap = grid::unit(2, "mm"),
+    cluster_columns = FALSE,
+    cluster_rows = FALSE,
+    show_column_names = FALSE,
+    show_row_names = TRUE,
+    row_names_side = "left",
+    row_names_gp = grid::gpar(fontsize = 8),
+    width = grid::unit(15, "cm"),
+    column_title = "Abundance (Per Sample)"
+  )
+
+  ht_logfc <- Heatmap(
+    logfc_mat,
+    name = "logFC",
+    col = colorRamp2(
+      c(-max_logfc, 0, max_logfc),
+      c("blue", "white", "red")
+    ),
+    cluster_columns = FALSE,
+    cluster_rows = FALSE,
+    show_row_names = FALSE,
+    column_names_gp = grid::gpar(fontsize = 10),
+    width = grid::unit(4, "cm"),
+    column_title = "logFC & Significance",
+    cell_fun = function(j, i, x, y, width, height, fill) {
+      if (!is.na(padj_mat[i, j]) && padj_mat[i, j] < 0.05) {
+        grid::grid.rect(
+          x = x, y = y, width = width, height = height,
+          gp = grid::gpar(col = "black", fill = NA, lwd = 1.5)
+        )
+      }
+      if (star_mat[i, j] != "") {
+        grid::grid.text(
+          star_mat[i, j], x, y, vjust = 0.7,
+          gp = grid::gpar(fontsize = 12, col = "black")
+        )
+      }
+    }
+  )
+
+  grDevices::pdf(filename, width = 14.29, height = height)
+  draw(
+    ht_abundance + ht_logfc,
+    main_heatmap = "Z-score",
+    padding = grid::unit(c(2, 2, 2, 2), "cm")
+  )
+  grDevices::dev.off()
+}
+
+draw_pathway_heatmap(
+  top15_pathways,
+  file.path(figure_dir, "004.heatmap_combined.pdf"),
+  height = 5.08
+)
+draw_pathway_heatmap(
+  remaining_pathways,
+  file.path(figure_dir, "004.heatmap_combined.excluding_top15.pdf"),
+  height = 5.08 * 3
+)
+
+write.csv(
+  data.frame(
+    pathway = selected_pathways,
+    heatmap_set = ifelse(selected_pathways %in% top15_pathways, "top15", "excluding_top15")
+  ),
+  file.path(table_dir, "pathway_heatmap_features.csv"),
+  row.names = FALSE
+)
+```
+
+## Pathway volcano plot
+
+```{r pathway-volcano}
+volcano_data <- pathway_results_long %>%
+  mutate(
+    color_group = case_when(
+      P.Value < 0.05 & logFC > 0 ~ "Up",
+      P.Value < 0.05 & logFC < 0 ~ "Down",
+      TRUE ~ "NS"
+    ),
+    shape_group = ifelse(adj.P.Val < 0.05, "adjSig", "nonAdj"),
+    type = factor(type, levels = comparison_names)
+  )
+
+volcano_plot <- ggplot(
+  volcano_data,
+  aes(
+    x = logFC, y = -log10(P.Value),
+    size = shape_group, color = color_group, shape = shape_group
+  )
+) +
+  geom_point(alpha = 0.8) +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "grey50") +
+  scale_color_manual(values = c("Up" = "#D73027", "Down" = "#4575B4", "NS" = "grey70")) +
+  scale_shape_manual(values = c("adjSig" = 1, "nonAdj" = 16)) +
+  scale_size_manual(values = c("adjSig" = 4, "nonAdj" = 1)) +
+  facet_wrap(~ type, nrow = 2) +
+  theme_bw() +
+  theme(
+    aspect.ratio = 1,
+    legend.title = element_blank(),
+    plot.title = element_blank(),
+    panel.grid = element_blank(),
+    panel.border = element_rect(fill = NA, colour = "grey87")
+  )
+
+ggsave(
+  file.path(figure_dir, "004.volcano.pdf"),
+  plot = volcano_plot,
+  width = 11.15,
+  height = 4.45
+)
+print(volcano_plot)
+```
+
+# Longitudinal KO analysis and GSEA
+
+```{r longitudinal-ko-differential}
+ko_metadata <- metadata_for(colnames(ko_raw))
+ko_dat <- ko_raw[, rownames(ko_metadata), drop = FALSE]
+ko_dat <- ko_dat[!grepl("g__", rownames(ko_dat)), , drop = FALSE]
+ko_cpm <- to_cpm(ko_dat)
+ko_cpm <- ko_cpm[
+  rowSums(ko_cpm > 0) > ncol(ko_cpm) * prevalence_fraction,
+  , drop = FALSE
+]
+ko_log2 <- log2(ko_cpm + pseudo_count)
+
+ko_results <- fit_time_contrasts(ko_log2, ko_metadata)
+ko_results_long <- bind_rows(ko_results) %>%
+  rename(KO = feature)
+
+saveRDS(
+  list(
+    differential_results = ko_results,
+    cpm = ko_cpm,
+    metadata = ko_metadata[, c("Sample_Name", "timeIDcontiue"), drop = FALSE]
+  ),
+  file.path(table_dir, "longitudinal_KO_limma_results.rds")
+)
+write.csv(
+  ko_results_long,
+  file.path(table_dir, "longitudinal_KO_limma_results.csv"),
+  row.names = FALSE
+)
+```
+
+```{r longitudinal-ko-gsea}
+kegg_dat <- readRDS(kegg_file)
+required_kegg_columns <- c("A", "C_code", "C_name", "K")
+if (!all(required_kegg_columns %in% names(kegg_dat))) {
+  stop("The KEGG annotation file is missing required columns.")
+}
+
+run_longitudinal_gsea <- function(category) {
+  annotation <- kegg_dat %>%
+    filter(A != "A09160 Human Diseases", A == category)
+  term2gene <- annotation %>%
+    select(term = C_code, gene = K) %>%
+    distinct()
+  term2name <- annotation %>%
+    select(term = C_code, name = C_name) %>%
+    distinct()
+
+  ans <- lapply(comparison_names, function(comparison) {
+    tab <- ko_results[[comparison]]
+    gene_list <- tab$logFC
+    names(gene_list) <- tab$feature
+    gene_list <- sort(gene_list[is.finite(gene_list)], decreasing = TRUE)
+    term2gene_use <- term2gene[term2gene$gene %in% names(gene_list), , drop = FALSE]
+
+    GSEA(
+      geneList = gene_list,
+      TERM2GENE = term2gene_use,
+      TERM2NAME = term2name,
+      pvalueCutoff = 1,
+      verbose = FALSE
+    )
+  })
+  names(ans) <- comparison_names
+  ans
+}
+
+metabolism_gsea <- run_longitudinal_gsea("A09100 Metabolism")
+brite_gsea <- run_longitudinal_gsea("A09180 Brite Hierarchies")
+
+saveRDS(metabolism_gsea, file.path(table_dir, "longitudinal_KO_GSEA_metabolism.rds"))
+saveRDS(brite_gsea, file.path(table_dir, "longitudinal_KO_GSEA_brite.rds"))
+
+gsea_to_table <- function(x) {
+  bind_rows(lapply(names(x), function(comparison) {
+    tab <- as.data.frame(x[[comparison]])
+    tab$Comparison <- comparison
+    tab
+  }))
+}
+write.csv(
+  gsea_to_table(metabolism_gsea),
+  file.path(table_dir, "longitudinal_KO_GSEA_metabolism.csv"),
+  row.names = FALSE
+)
+write.csv(
+  gsea_to_table(brite_gsea),
+  file.path(table_dir, "longitudinal_KO_GSEA_brite.csv"),
+  row.names = FALSE
+)
+```
+
+## Selected GSEA enrichment curves
+
+```{r selected-gsea-plots}
+require_gene_sets <- function(gsea_object, ids, label) {
+  available <- as.data.frame(gsea_object)$ID
+  missing <- setdiff(ids, available)
+  if (length(missing) > 0L) {
+    stop(label, " is missing GSEA set(s): ", paste(missing, collapse = ", "))
+  }
+}
+
+metabolism_ids <- c("ko00121", "ko00640", "ko00920")
+require_gene_sets(metabolism_gsea[["M1_vs_BL"]], metabolism_ids, "M1_vs_BL metabolism")
+require_gene_sets(metabolism_gsea[["D14_vs_BL"]], metabolism_ids, "D14_vs_BL metabolism")
+
+gsea_m1 <- gseaplot2(
+  metabolism_gsea[["M1_vs_BL"]],
+  geneSetID = metabolism_ids,
+  color = c("#E41749", "#007A87", "#FFB400"),
+  subplots = c(1, 2, 3),
+  pvalue_table = TRUE
+)
+ggsave(
+  file.path(figure_dir, "005.GSEA.M1_vs_BL.pdf"),
+  plot = gsea_m1, width = 6.98, height = 3.11
+)
+
+gsea_d14 <- gseaplot2(
+  metabolism_gsea[["D14_vs_BL"]],
+  geneSetID = metabolism_ids,
+  color = c("#E41749", "#007A87", "#FFB400"),
+  subplots = c(1, 2, 3),
+  pvalue_table = TRUE
+)
+ggsave(
+  file.path(figure_dir, "005.GSEA.D14_vs_BL.pdf"),
+  plot = gsea_d14, width = 6.98, height = 3.11
+)
+
+amr_id <- "ko01504"
+require_gene_sets(brite_gsea[["M1_vs_BL"]], amr_id, "M1_vs_BL Brite")
+require_gene_sets(brite_gsea[["M3_vs_BL"]], amr_id, "M3_vs_BL Brite")
+
+gsea_m1_amr <- gseaplot2(
+  brite_gsea[["M1_vs_BL"]],
+  geneSetID = amr_id,
+  color = "#FCCDE5",
+  subplots = c(1, 2, 3),
+  pvalue_table = TRUE
+)
+ggsave(
+  file.path(figure_dir, "005.GSEA.M1_vs_BL.antimicrobial_resistance.pdf"),
+  plot = gsea_m1_amr, width = 11.53, height = 3.23
+)
+
+gsea_m3_amr <- gseaplot2(
+  brite_gsea[["M3_vs_BL"]],
+  geneSetID = amr_id,
+  color = "#FCCDE5",
+  subplots = c(1, 2, 3),
+  pvalue_table = TRUE
+)
+ggsave(
+  file.path(figure_dir, "005.GSEA.M3_vs_BL.antimicrobial_resistance.pdf"),
+  plot = gsea_m3_amr, width = 11.53, height = 3.23
+)
+
+print(gsea_d14)
+```
+
+# KO comparisons by clinical outcome
+
+The outcome analyses use the same comparison direction as the source analysis:
+`later - early`. Positive log-fold changes and positive NES values therefore
+indicate higher values in the later-response group.
+
+```{r outcome-analysis-functions}
+outcome_time_levels <- time_levels[time_levels != "009_M6"]
+outcome_definitions <- list(
+  Result_M1 = list(
+    metadata_column = "outcome_M1",
+    group_map = c("Fast_responders" = "early", "Delayed_responders" = "later")
+  ),
+  Result_M3 = list(
+    metadata_column = "outcome_M3",
+    group_map = c("Responder" = "early", "Non-responder" = "later")
+  )
+)
+min_group_n <- 2
+
+empty_outcome_result <- function() {
+  data.frame(
+    logFC = numeric(), AveExpr = numeric(), t = numeric(),
+    P.Value = numeric(), adj.P.Val = numeric(), B = numeric(),
+    Mean_early = numeric(), Mean_later = numeric(),
+    KO = character(), timeID = character(), outcome = character(),
+    comparison = character(), stringsAsFactors = FALSE
+  )
+}
+
+fit_outcome_by_time <- function(y, metadata, outcome_name, outcome_column, group_map) {
+  mapped_group <- unname(group_map[as.character(metadata[[outcome_column]])])
+  results <- list()
+  sample_counts <- list()
+
+  for (timepoint in outcome_time_levels) {
+    keep <- metadata$timeIDcontiue == timepoint &
+      !is.na(mapped_group) & mapped_group %in% c("early", "later")
+    group <- factor(mapped_group[keep], levels = c("early", "later"))
+    group_n <- table(group)
+
+    sample_counts[[timepoint]] <- data.frame(
+      outcome = outcome_name,
+      timeID = timepoint,
+      group = names(group_n),
+      n = as.integer(group_n)
+    )
+
+    if (length(group) == 0L || any(group_n < min_group_n)) {
+      results[[timepoint]] <- empty_outcome_result()
+      next
+    }
+
+    y_time <- y[, keep, drop = FALSE]
+    design <- model.matrix(~ 0 + group)
+    colnames(design) <- levels(group)
+    fit <- eBayes(lmFit(y_time, design), trend = TRUE)
+    contrast_matrix <- makeContrasts(later - early, levels = design)
+    fit2 <- eBayes(contrasts.fit(fit, contrast_matrix), trend = TRUE)
+
+    tab <- topTable(fit2, coef = 1, n = Inf, adjust.method = "BH", sort.by = "P")
+    tab$Mean_early <- fit$coefficients[rownames(tab), "early"]
+    tab$Mean_later <- fit$coefficients[rownames(tab), "later"]
+    tab$KO <- rownames(tab)
+    tab$timeID <- timepoint
+    tab$outcome <- outcome_name
+    tab$comparison <- "later_vs_early"
+    rownames(tab) <- NULL
+    results[[timepoint]] <- tab
+  }
+
+  list(results = results, sample_counts = bind_rows(sample_counts))
+}
+
+run_outcome_gsea <- function(differential_results) {
+  annotation <- kegg_dat %>%
+    filter(A != "A09160 Human Diseases", A == "A09100 Metabolism")
+  term2gene <- annotation %>%
+    select(term = C_code, gene = K) %>%
+    distinct()
+  term2name <- annotation %>%
+    select(term = C_code, name = C_name) %>%
+    distinct()
+
+  ans <- lapply(names(differential_results), function(timepoint) {
+    tab <- differential_results[[timepoint]]
+    if (nrow(tab) == 0L) return(NULL)
+    gene_list <- tab$logFC
+    names(gene_list) <- tab$KO
+    gene_list <- sort(
+      gene_list[is.finite(gene_list) & !duplicated(names(gene_list))],
+      decreasing = TRUE
+    )
+    term2gene_use <- term2gene[term2gene$gene %in% names(gene_list), , drop = FALSE]
+    GSEA(
+      geneList = gene_list,
+      TERM2GENE = term2gene_use,
+      TERM2NAME = term2name,
+      pvalueCutoff = 1,
+      minGSSize = 5,
+      maxGSSize = 500,
+      verbose = FALSE
+    )
+  })
+  names(ans) <- names(differential_results)
+  ans
+}
+
+plot_outcome_heatmap <- function(
+  enrichment_table,
+  outcome_name,
+  all_significant = FALSE
+) {
+  p_cutoff <- 0.05
+  top_n <- 15
+  enrichment_table <- enrichment_table %>%
+    filter(is.finite(NES), !is.na(p.adjust)) %>%
+    distinct(timeID, ID, .keep_all = TRUE)
+
+  significant_ids <- enrichment_table %>%
+    filter(p.adjust <= p_cutoff) %>%
+    pull(ID) %>%
+    unique()
+
+  if (all_significant) {
+    selected_ids <- significant_ids
+  } else {
+    source_table <- if (length(significant_ids) > 0L) {
+      enrichment_table %>% filter(ID %in% significant_ids)
+    } else {
+      enrichment_table
+    }
+    selected_ids <- source_table %>%
+      group_by(timeID) %>%
+      slice_min(order_by = p.adjust, n = top_n, with_ties = FALSE) %>%
+      ungroup() %>%
+      pull(ID) %>%
+      unique()
+  }
+
+  if (length(selected_ids) == 0L) {
+    plot <- ggplot() +
+      annotate("text", x = 1, y = 1, label = "No GSEA result") +
+      theme_void()
+    return(list(plot = plot, height = 6))
+  }
+
+  pathway_names <- enrichment_table %>%
+    filter(ID %in% selected_ids) %>%
+    mutate(
+      term_label = ifelse(
+        is.na(Description) | Description == "",
+        ID,
+        paste0(Description, " [", ID, "]")
+      )
+    ) %>%
+    group_by(ID) %>%
+    summarise(term_label = first(term_label), .groups = "drop")
+
+  heatmap_data <- expand.grid(
+    timeID = outcome_time_levels,
+    ID = selected_ids,
+    stringsAsFactors = FALSE
+  ) %>%
+    left_join(
+      enrichment_table %>%
+        filter(ID %in% selected_ids) %>%
+        select(timeID, ID, NES, p.adjust),
+      by = c("timeID", "ID")
+    ) %>%
+    left_join(pathway_names, by = "ID") %>%
+    mutate(
+      significance = case_when(
+        !is.na(p.adjust) & p.adjust < 0.001 ~ "***",
+        !is.na(p.adjust) & p.adjust < 0.01 ~ "**",
+        !is.na(p.adjust) & p.adjust <= p_cutoff ~ "*",
+        TRUE ~ ""
+      ),
+      timeID = factor(timeID, levels = outcome_time_levels)
+    )
+
+  term_order <- enrichment_table %>%
+    filter(ID %in% selected_ids) %>%
+    group_by(ID) %>%
+    summarise(best_p = min(p.adjust, na.rm = TRUE), .groups = "drop") %>%
+    left_join(pathway_names, by = "ID") %>%
+    arrange(desc(best_p)) %>%
+    pull(term_label)
+  heatmap_data$term_label <- factor(heatmap_data$term_label, levels = term_order)
+
+  subtitle <- if (all_significant) {
+    "Pathways significant at one or more timepoints; * adjusted P <= 0.05"
+  } else {
+    "Top 15 pathways per timepoint; * adjusted P < 0.05"
+  }
+
+  plot <- ggplot(heatmap_data, aes(x = timeID, y = term_label, fill = NES)) +
+    geom_tile(color = "white", linewidth = 0.25) +
+    geom_text(aes(label = significance), size = 3) +
+    scale_fill_gradient2(
+      low = "#2166AC", mid = "white", high = "#B2182B",
+      midpoint = 0, na.value = "grey90", name = "NES"
+    ) +
+    labs(
+      x = "Time point", y = NULL,
+      title = paste0(outcome_name, ": later vs early KO GSEA"),
+      subtitle = subtitle
+    ) +
+    theme_bw(base_size = 11) +
+    theme(
+      panel.grid = element_blank(),
+      axis.text.x = element_text(angle = 45, hjust = 1),
+      axis.text.y = element_text(size = 8),
+      plot.title = element_text(face = "bold")
+    )
+
+  list(
+    plot = plot,
+    height = if (all_significant) {
+      max(6, 2 + 0.28 * length(selected_ids))
+    } else {
+      max(6, min(20, 2 + 0.28 * length(selected_ids)))
+    }
+  )
+}
+```
+
+```{r run-outcome-analyses}
+outcome_metadata <- metadata_for(colnames(ko_raw), outcome_time_levels)
+outcome_ko <- ko_raw[, rownames(outcome_metadata), drop = FALSE]
+outcome_ko <- outcome_ko[!grepl("g__", rownames(outcome_ko)), , drop = FALSE]
+outcome_ko_cpm <- to_cpm(outcome_ko)
+outcome_ko_cpm <- outcome_ko_cpm[
+  rowSums(outcome_ko_cpm > 0) > ncol(outcome_ko_cpm) * prevalence_fraction,
+  , drop = FALSE
+]
+outcome_ko_log2 <- log2(outcome_ko_cpm + pseudo_count)
+
+outcome_summary <- list()
+
+for (outcome_name in names(outcome_definitions)) {
+  definition <- outcome_definitions[[outcome_name]]
+  fitted <- fit_outcome_by_time(
+    outcome_ko_log2,
+    outcome_metadata,
+    outcome_name,
+    definition$metadata_column,
+    definition$group_map
+  )
+  enrichment <- run_outcome_gsea(fitted$results)
+  enrichment_table <- bind_rows(lapply(names(enrichment), function(timepoint) {
+    if (is.null(enrichment[[timepoint]])) return(NULL)
+    tab <- as.data.frame(enrichment[[timepoint]])
+    tab$timeID <- timepoint
+    tab$outcome <- outcome_name
+    tab$comparison <- "later_vs_early"
+    tab
+  }))
+
+  this_dir <- file.path(outcome_dir, outcome_name)
+  dir.create(this_dir, recursive = TRUE, showWarnings = FALSE)
+
+  saveRDS(
+    fitted$results,
+    file.path(this_dir, paste0(outcome_name, ".later_vs_early.differential_KO.rds"))
+  )
+  write.csv(
+    bind_rows(fitted$results),
+    file.path(this_dir, paste0(outcome_name, ".later_vs_early.differential_KO.csv")),
+    row.names = FALSE
+  )
+  write.csv(
+    fitted$sample_counts,
+    file.path(this_dir, paste0(outcome_name, ".later_vs_early.sample_counts.csv")),
+    row.names = FALSE
+  )
+  saveRDS(
+    enrichment,
+    file.path(this_dir, paste0(outcome_name, ".later_vs_early.KO_GSEA.rds"))
+  )
+  write.csv(
+    enrichment_table,
+    file.path(this_dir, paste0(outcome_name, ".later_vs_early.KO_GSEA.csv")),
+    row.names = FALSE
+  )
+
+  top_plot <- plot_outcome_heatmap(
+    enrichment_table,
+    outcome_name,
+    all_significant = FALSE
+  )
+  ggsave(
+    file.path(this_dir, paste0(outcome_name, ".later_vs_early.KO_GSEA_heatmap.pdf")),
+    plot = top_plot$plot,
+    width = 10,
+    height = top_plot$height,
+    limitsize = FALSE
+  )
+
+  all_plot <- plot_outcome_heatmap(
+    enrichment_table,
+    outcome_name,
+    all_significant = TRUE
+  )
+  ggsave(
+    file.path(
+      this_dir,
+      paste0(outcome_name, ".later_vs_early.KO_GSEA_all_significant_heatmap.pdf")
+    ),
+    plot = all_plot$plot,
+    width = 10,
+    height = all_plot$height,
+    limitsize = FALSE
+  )
+
+  outcome_summary[[outcome_name]] <- fitted$sample_counts
+}
+
+outcome_summary_table <- bind_rows(outcome_summary)
+write.csv(
+  outcome_summary_table,
+  file.path(table_dir, "outcome_KO_analysis_sample_counts.csv"),
+  row.names = FALSE
+)
+knitr::kable(outcome_summary_table)
+```
+
+# Output inventory
+
+```{r output-inventory}
+output_inventory <- data.frame(
+  file = sort(list.files(output_dir, recursive = TRUE)),
+  stringsAsFactors = FALSE
+)
+write.csv(
+  output_inventory,
+  file.path(table_dir, "output_inventory.csv"),
+  row.names = FALSE
+)
+knitr::kable(output_inventory)
+```

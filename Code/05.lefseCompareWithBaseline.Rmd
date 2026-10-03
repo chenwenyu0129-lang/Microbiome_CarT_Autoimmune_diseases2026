@@ -1,0 +1,610 @@
+---
+title: "LEfSe comparisons with baseline across treatment timepoints"
+output:
+  html_document:
+    toc: true
+    number_sections: true
+    self_contained: true
+---
+
+This analysis identifies bacterial species that differ between baseline and
+six post-treatment timepoints using LEfSe, visualizes their abundance patterns,
+summarizes recurrent genera, and compares two Bifidobacterium species over time.
+
+```{r setup, include=FALSE}
+options(stringsAsFactors = FALSE)
+
+suppressPackageStartupMessages({
+  library(lefser)
+  library(SummarizedExperiment)
+  library(ComplexHeatmap)
+  library(circlize)
+  library(dplyr)
+  library(tidyr)
+  library(stringr)
+  library(forcats)
+  library(ggplot2)
+  library(rstatix)
+  library(ggpubr)
+})
+
+input_file <- "000.input16S.Rds"
+taxonomy_file <- "000.lefse_taxonomy_annotation.Rds"
+analysis_name <- "05.lefseCompareWithBaseline"
+output_root <- analysis_name
+figure_dir <- file.path(output_root, "figures")
+table_dir <- file.path(output_root, "tables")
+
+dir.create(output_root, recursive = TRUE, showWarnings = FALSE)
+dir.create(figure_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(table_dir, recursive = TRUE, showWarnings = FALSE)
+
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.path = file.path(output_root, "knitr_figures", "")
+)
+
+baseline_timepoint <- "001_BL"
+comparison_timepoints <- c(
+  "002_D0", "003_D14", "004_M1",
+  "005_M2", "006_M3", "009_M6"
+)
+analysis_timepoints <- c(
+  "001_BL", "002_D0", "003_D14", "004_M1", "005_M2",
+  "006_M3", "007_M4", "008_M5", "009_M6"
+)
+
+timepoint_colors <- c(
+  "001_BL" = "#999999",
+  "002_D0" = "#377EB8",
+  "003_D14" = "#E41A1C",
+  "004_M1" = "#984EA3",
+  "005_M2" = "#FF7F00",
+  "006_M3" = "#FFFF33",
+  "007_M4" = "#A65628",
+  "008_M5" = "#F781BF",
+  "009_M6" = "#4DAF4A"
+)
+```
+
+# 1. Input preparation
+
+```{r prepare-input}
+if (!file.exists(input_file)) {
+  stop("Input file not found: ", input_file)
+}
+if (!file.exists(taxonomy_file)) {
+  stop("Taxonomy annotation file not found: ", taxonomy_file)
+}
+
+input16S <- readRDS(input_file)
+if (!is.list(input16S) || !all(c("dat_rela", "metainfo") %in% names(input16S))) {
+  stop("000.input16S.Rds must contain dat_rela and metainfo.")
+}
+
+dat_rela <- input16S$dat_rela
+metainfo <- input16S$metainfo
+dat_name <- readRDS(taxonomy_file)
+
+required_metadata <- c("Sample_Name", "timeIDcontiue")
+missing_metadata <- setdiff(required_metadata, names(metainfo))
+if (length(missing_metadata) > 0L) {
+  stop("Missing metadata column(s): ", paste(missing_metadata, collapse = ", "))
+}
+if (!identical(colnames(dat_rela), as.character(metainfo$Sample_Name))) {
+  stop("dat_rela columns are not aligned with metainfo$Sample_Name.")
+}
+if (!"species" %in% names(dat_name)) {
+  stop("The taxonomy annotation must contain a species column.")
+}
+
+metadata_select <- metainfo |>
+  dplyr::filter(.data$timeIDcontiue %in% analysis_timepoints) |>
+  dplyr::mutate(
+    Sample_Name = as.character(.data$Sample_Name),
+    timeIDcontiue = as.character(.data$timeIDcontiue)
+  )
+
+dat_rela_select <- dat_rela[, metadata_select$Sample_Name, drop = FALSE]
+dat_rela_select <- dat_rela_select[rowSums(dat_rela_select) > 0, , drop = FALSE]
+
+dat_name <- dat_name[match(rownames(dat_rela_select), dat_name$species), , drop = FALSE]
+if (anyNA(dat_name$species)) {
+  stop("Some abundance rows are missing from the taxonomy annotation.")
+}
+rownames(dat_name) <- dat_name$species
+if (!identical(rownames(dat_name), rownames(dat_rela_select))) {
+  stop("Taxonomy rows are not aligned with the abundance matrix.")
+}
+
+rownames(metadata_select) <- metadata_select$Sample_Name
+taxonomy_row_data <- dat_name[, setdiff(names(dat_name), "merger"), drop = FALSE]
+
+objectD <- SummarizedExperiment::SummarizedExperiment(
+  assays = list(counts = as.matrix(dat_rela_select)),
+  colData = as.data.frame(metadata_select),
+  rowData = taxonomy_row_data
+)
+
+data.frame(
+  samples = ncol(objectD),
+  species = nrow(objectD),
+  timepoints = dplyr::n_distinct(metadata_select$timeIDcontiue)
+)
+```
+
+# 2. LEfSe comparisons with baseline
+
+Each post-treatment timepoint is compared independently with baseline. The
+original random seed is reset before every LEfSe fit.
+
+```{r run-lefse}
+lefse_results <- list()
+
+for (timepoint in comparison_timepoints) {
+  object_select <- objectD[
+    , objectD$timeIDcontiue %in% c(baseline_timepoint, timepoint)
+  ]
+
+  set.seed(1234)
+  result_timepoint <- suppressWarnings(
+    lefser::lefser(
+      object_select,
+      groupCol = "timeIDcontiue"
+    )
+  )
+
+  result_timepoint <- as.data.frame(result_timepoint)
+  if (nrow(result_timepoint) > 0L) {
+    result_timepoint$group <- ifelse(
+      result_timepoint$scores > 0,
+      "TimePoint",
+      "BL"
+    )
+  }
+  lefse_results[[timepoint]] <- result_timepoint
+}
+
+lefse_result_summary <- data.frame(
+  timepoint = comparison_timepoints,
+  significant_species = vapply(
+    comparison_timepoints,
+    function(timepoint) nrow(lefse_results[[timepoint]]),
+    integer(1)
+  )
+)
+
+lefse_result_summary
+```
+
+# 3. LEfSe score and abundance heatmap
+
+```{r prepare-heatmap-data}
+lefse_bacteria <- unique(unlist(lapply(
+  comparison_timepoints,
+  function(timepoint) as.character(lefse_results[[timepoint]]$Names)
+)))
+
+counts_matrix <- SummarizedExperiment::assay(objectD, "counts")
+metadata <- as.data.frame(SummarizedExperiment::colData(objectD))
+
+target_bacteria <- intersect(lefse_bacteria, rownames(counts_matrix))
+valid_samples <- intersect(metadata$Sample_Name, colnames(counts_matrix))
+heatmap_data <- counts_matrix[target_bacteria, valid_samples, drop = FALSE]
+
+matched_index <- match(colnames(heatmap_data), metadata$Sample_Name)
+metadata_matched <- metadata[matched_index, , drop = FALSE]
+
+log_cpm <- log2(heatmap_data + 1)
+calculate_z_score <- function(values) {
+  value_sd <- stats::sd(values)
+  if (!is.finite(value_sd) || value_sd == 0) {
+    return(rep(0, length(values)))
+  }
+  (values - mean(values)) / value_sd
+}
+heatmap_data_z <- t(apply(log_cpm, 1, calculate_z_score))
+heatmap_data_z[heatmap_data_z > 3] <- 3
+heatmap_data_z[heatmap_data_z < -3] <- -3
+
+lefse_score_matrix <- matrix(
+  NA_real_,
+  nrow = length(target_bacteria),
+  ncol = length(comparison_timepoints),
+  dimnames = list(target_bacteria, comparison_timepoints)
+)
+
+for (timepoint in comparison_timepoints) {
+  result_timepoint <- lefse_results[[timepoint]]
+  match_index <- match(target_bacteria, as.character(result_timepoint$Names))
+  lefse_score_matrix[, timepoint] <- result_timepoint$scores[match_index]
+}
+
+lefse_score_output <- data.frame(
+  Names = rownames(lefse_score_matrix),
+  lefse_score_matrix,
+  check.names = FALSE
+)
+utils::write.csv(
+  lefse_score_output,
+  file.path(table_dir, "lefse_score_matrix.csv"),
+  row.names = FALSE,
+  na = ""
+)
+```
+
+```{r draw-heatmap, fig.width=9.95, fig.height=9.17}
+minimum_score <- min(lefse_score_matrix, na.rm = TRUE)
+maximum_score <- max(lefse_score_matrix, na.rm = TRUE)
+
+lda_color_function <- if (minimum_score < 0) {
+  circlize::colorRamp2(
+    c(minimum_score, 0, maximum_score),
+    c("seagreen", "white", "purple")
+  )
+} else {
+  circlize::colorRamp2(c(0, maximum_score), c("white", "purple"))
+}
+
+lefse_score_heatmap <- ComplexHeatmap::Heatmap(
+  lefse_score_matrix,
+  name = "LDA Score",
+  col = lda_color_function,
+  na_col = "grey90",
+  rect_gp = grid::gpar(col = "white", lwd = 1),
+  cluster_columns = FALSE,
+  cluster_rows = TRUE,
+  show_row_names = TRUE,
+  row_names_gp = grid::gpar(fontsize = 8),
+  column_names_rot = 45,
+  column_names_gp = grid::gpar(fontsize = 9),
+  column_title = "LEfSe Scores",
+  width = grid::unit(4, "cm")
+)
+
+time_group <- as.character(metadata_matched$timeIDcontiue)
+column_annotation <- ComplexHeatmap::HeatmapAnnotation(
+  TimePoint = time_group,
+  col = list(TimePoint = timepoint_colors)
+)
+zscore_color_function <- circlize::colorRamp2(
+  c(-3, 0, 3),
+  c("#084594", "white", "firebrick3")
+)
+
+abundance_heatmap <- ComplexHeatmap::Heatmap(
+  heatmap_data_z,
+  name = "Z-score",
+  col = zscore_color_function,
+  top_annotation = column_annotation,
+  column_split = factor(time_group, levels = names(timepoint_colors)),
+  clustering_method_rows = "ward.D",
+  clustering_method_columns = "mcquitty",
+  cluster_column_slices = FALSE,
+  cluster_columns = TRUE,
+  show_column_names = FALSE,
+  show_row_names = FALSE,
+  column_title = "Sample Expressions"
+)
+
+combined_heatmap <- abundance_heatmap + lefse_score_heatmap
+heatmap_pdf <- file.path(figure_dir, "lefse_score_and_abundance_heatmap.pdf")
+
+grDevices::pdf(heatmap_pdf, width = 9.95, height = 9.17)
+ComplexHeatmap::draw(combined_heatmap, main_heatmap = "Z-score")
+grDevices::dev.off()
+
+ComplexHeatmap::draw(combined_heatmap, main_heatmap = "Z-score")
+```
+
+# 4. Top genera before and after deduplication
+
+```{r prepare-genus-counts}
+names_raw <- unlist(lapply(
+  comparison_timepoints,
+  function(timepoint) as.character(lefse_results[[timepoint]]$Names)
+))
+names_unique <- unique(names_raw)
+
+process_taxa_count <- function(taxa_names, status_name) {
+  genus_extracted <- vapply(
+    strsplit(taxa_names, "_", fixed = TRUE),
+    function(parts) {
+      if (length(parts) >= 3L) parts[3] else NA_character_
+    },
+    character(1)
+  )
+  genus_extracted[
+    is.na(genus_extracted) |
+      genus_extracted == "" |
+      genus_extracted == "NA"
+  ] <- "Unclassified"
+
+  data.frame(Genus = genus_extracted, stringsAsFactors = FALSE) |>
+    dplyr::count(.data$Genus, name = "Count") |>
+    dplyr::mutate(Status = status_name)
+}
+
+genus_count_raw <- process_taxa_count(names_raw, "Before deduplication")
+genus_count_unique <- process_taxa_count(names_unique, "After deduplication")
+
+top10_genera <- genus_count_raw |>
+  dplyr::filter(.data$Genus != "Unclassified") |>
+  dplyr::slice_max(order_by = .data$Count, n = 10, with_ties = FALSE) |>
+  dplyr::pull(.data$Genus)
+
+genus_plot_data <- dplyr::bind_rows(genus_count_raw, genus_count_unique) |>
+  dplyr::filter(.data$Genus %in% top10_genera) |>
+  dplyr::mutate(
+    Status = factor(
+      .data$Status,
+      levels = c("Before deduplication", "After deduplication")
+    )
+  ) |>
+  tidyr::complete(
+    Genus = top10_genera,
+    Status = factor(
+      c("Before deduplication", "After deduplication"),
+      levels = c("Before deduplication", "After deduplication")
+    ),
+    fill = list(Count = 0)
+  )
+
+genus_order <- genus_plot_data |>
+  dplyr::filter(.data$Status == "Before deduplication") |>
+  dplyr::arrange(.data$Count) |>
+  dplyr::pull(.data$Genus)
+
+genus_plot_data <- genus_plot_data |>
+  dplyr::mutate(Genus = factor(.data$Genus, levels = genus_order))
+
+genus_line_data <- genus_plot_data |>
+  dplyr::select(.data$Genus, .data$Status, .data$Count) |>
+  tidyr::pivot_wider(
+    names_from = .data$Status,
+    values_from = .data$Count,
+    values_fill = 0
+  )
+```
+
+```{r draw-genus-counts, fig.width=5.54, fig.height=5.07}
+p_genus_counts <- ggplot2::ggplot() +
+  ggplot2::geom_segment(
+    data = genus_line_data,
+    ggplot2::aes(
+      x = .data[["After deduplication"]],
+      xend = .data[["Before deduplication"]],
+      y = .data$Genus,
+      yend = .data$Genus
+    ),
+    linewidth = 0.7,
+    color = "grey70"
+  ) +
+  ggplot2::geom_point(
+    data = genus_plot_data,
+    ggplot2::aes(
+      x = .data$Count,
+      y = .data$Genus,
+      color = .data$Status,
+      shape = .data$Status
+    ),
+    size = 4,
+    stroke = 1
+  ) +
+  ggplot2::geom_text(
+    data = genus_plot_data,
+    ggplot2::aes(
+      x = .data$Count + 1,
+      y = .data$Genus,
+      label = .data$Count,
+      color = .data$Status
+    ),
+    hjust = -0.4,
+    size = 3.5,
+    show.legend = FALSE
+  ) +
+  ggplot2::scale_shape_manual(
+    values = c("Before deduplication" = 16, "After deduplication" = 17)
+  ) +
+  ggplot2::scale_color_manual(
+    values = c(
+      "Before deduplication" = "#D55E00",
+      "After deduplication" = "#0072B2"
+    )
+  ) +
+  ggplot2::scale_x_continuous(
+    expand = ggplot2::expansion(mult = c(0.02, 0.15)),
+    limits = c(0, 10)
+  ) +
+  ggplot2::labs(
+    x = "Count",
+    y = "Top 10 genera",
+    color = NULL,
+    shape = NULL
+  ) +
+  ggplot2::theme_bw(base_size = 12) +
+  ggplot2::theme(
+    legend.title = ggplot2::element_blank(),
+    plot.title = ggplot2::element_blank(),
+    axis.text.x = ggplot2::element_text(angle = 0, hjust = 0.5, family = "ArialMT"),
+    axis.text = ggplot2::element_text(family = "ArialMT"),
+    axis.title = ggplot2::element_text(family = "ArialMT"),
+    panel.grid = ggplot2::element_blank(),
+    panel.border = ggplot2::element_rect(fill = NA, colour = "grey87")
+  )
+
+ggplot2::ggsave(
+  file.path(figure_dir, "top10_genera_deduplicated_comparison.pdf"),
+  p_genus_counts,
+  width = 5.54,
+  height = 5.07
+)
+
+p_genus_counts
+```
+
+# 5. Longitudinal Bifidobacterium comparison
+
+```{r prepare-bifidobacterium-data}
+bifidobacterium_species <- c(
+  "s__Bifidobacterium_breve",
+  "s__Bifidobacterium_dentium"
+)
+bifidobacterium_timepoints <- c(
+  "001_BL", "002_D0", "003_D14",
+  "004_M1", "005_M2", "006_M3", "009_M6"
+)
+
+missing_species <- setdiff(bifidobacterium_species, rownames(counts_matrix))
+if (length(missing_species) > 0L) {
+  stop("Missing target species: ", paste(missing_species, collapse = ", "))
+}
+
+bifidobacterium_expression <- t(
+  counts_matrix[bifidobacterium_species, , drop = FALSE]
+) |>
+  as.data.frame() |>
+  tibble::rownames_to_column("Sample_Name")
+
+bifidobacterium_plot_data <- bifidobacterium_expression |>
+  dplyr::inner_join(
+    metadata |>
+      dplyr::select(.data$Sample_Name, .data$timeIDcontiue),
+    by = "Sample_Name"
+  ) |>
+  dplyr::filter(.data$timeIDcontiue %in% bifidobacterium_timepoints) |>
+  tidyr::pivot_longer(
+    cols = dplyr::all_of(bifidobacterium_species),
+    names_to = "Species",
+    values_to = "Abundance"
+  ) |>
+  dplyr::mutate(
+    Log_Abundance = log(as.numeric(.data$Abundance) + 1),
+    timeIDcontiue = factor(
+      as.character(.data$timeIDcontiue),
+      levels = bifidobacterium_timepoints,
+      labels = c("BL", "D0", "D14", "M1", "M2", "M3", "M6")
+    ),
+    Species = factor(.data$Species, levels = bifidobacterium_species)
+  )
+
+bifidobacterium_annotation_caps <- bifidobacterium_plot_data |>
+  dplyr::group_by(.data$timeIDcontiue) |>
+  dplyr::summarise(
+    annotation_cap = max(.data$Log_Abundance, na.rm = TRUE) + 0.6,
+    .groups = "drop"
+  )
+
+bifidobacterium_stat_test <- bifidobacterium_plot_data |>
+  dplyr::group_by(.data$timeIDcontiue) |>
+  rstatix::wilcox_test(Log_Abundance ~ Species, paired = TRUE) |>
+  rstatix::adjust_pvalue(method = "BH") |>
+  rstatix::add_significance("p") |>
+  rstatix::add_xy_position(x = "timeIDcontiue", dodge = 0.8) |>
+  dplyr::left_join(
+    bifidobacterium_annotation_caps,
+    by = "timeIDcontiue"
+  ) |>
+  dplyr::mutate(
+    y.position = pmin(.data$y.position, .data$annotation_cap)
+  ) |>
+  dplyr::select(-dplyr::all_of("annotation_cap"))
+
+bifidobacterium_stat_test
+```
+
+```{r draw-bifidobacterium-comparison, fig.width=10.14, fig.height=7}
+p_bifidobacterium <- ggplot2::ggplot(
+  bifidobacterium_plot_data,
+  ggplot2::aes(
+    x = .data$timeIDcontiue,
+    y = .data$Log_Abundance,
+    fill = .data$Species
+  )
+) +
+  ggplot2::geom_boxplot(
+    position = ggplot2::position_dodge(width = 0.8),
+    width = 0.65,
+    alpha = 0.65,
+    outlier.shape = NA,
+    color = "black"
+  ) +
+  ggplot2::geom_point(
+    ggplot2::aes(color = .data$Species),
+    position = ggplot2::position_jitterdodge(
+      jitter.width = 0.12,
+      dodge.width = 0.8,
+      seed = 1234
+    ),
+    size = 1.8,
+    alpha = 0.65
+  ) +
+  ggplot2::stat_summary(
+    ggplot2::aes(group = .data$Species, color = .data$Species),
+    fun = mean,
+    geom = "line",
+    linewidth = 1,
+    position = ggplot2::position_dodge(width = 0.8)
+  ) +
+  ggplot2::stat_summary(
+    ggplot2::aes(group = .data$Species, color = .data$Species),
+    fun = mean,
+    geom = "point",
+    shape = 21,
+    size = 3,
+    stroke = 1,
+    position = ggplot2::position_dodge(width = 0.8)
+  ) +
+  ggpubr::stat_compare_means(
+    method = "t.test",
+    label = "p",
+    bracket.size = 0.4,
+    label.y = max(bifidobacterium_plot_data$Log_Abundance, na.rm = TRUE) * 1.18
+  ) +
+  ggpubr::stat_pvalue_manual(
+    bifidobacterium_stat_test,
+    label = "p.signif",
+    tip.length = 0.01,
+    bracket.size = 0.4,
+    hide.ns = FALSE,
+    inherit.aes = FALSE
+  ) +
+  ggplot2::labs(
+    x = NULL,
+    y = "Log abundance",
+    fill = "Species",
+    color = "Species"
+  ) +
+  ggplot2::theme_bw(base_size = 12) +
+  ggplot2::theme(
+    legend.title = ggplot2::element_blank(),
+    plot.title = ggplot2::element_blank(),
+    axis.text.x = ggplot2::element_text(angle = 0, hjust = 0.5, family = "ArialMT"),
+    axis.text = ggplot2::element_text(family = "ArialMT"),
+    axis.title = ggplot2::element_text(family = "ArialMT"),
+    panel.grid = ggplot2::element_blank(),
+    panel.border = ggplot2::element_rect(fill = NA, colour = "grey87")
+  ) +
+  ggplot2::scale_fill_manual(values = c("#ef6548", "#67a9cf")) +
+  ggplot2::scale_color_manual(values = c("#ef6548", "#67a9cf")) +
+  ggplot2::scale_y_continuous(
+    expand = ggplot2::expansion(mult = c(0.02, 0.08))
+  )
+
+ggplot2::ggsave(
+  file.path(figure_dir, "bifidobacterium_species_comparison.pdf"),
+  p_bifidobacterium,
+  width = 10.14,
+  height = 7
+)
+
+p_bifidobacterium
+```
+
+# 6. Session information
+
+```{r session-information}
+sessionInfo()
+```

@@ -1,0 +1,882 @@
+---
+title: "Baseline bacterial score models for M1 outcome prediction"
+output:
+  html_document:
+    toc: true
+    number_sections: true
+    self_contained: true
+---
+
+This analysis trains baseline gut bacterial score models for predicting the M1
+response class and evaluates each fixed baseline model at D0 and D14. Three
+predefined feature configurations are assessed: D14-associated bacteria,
+B-cell reconstitution-associated bacteria, and their union.
+
+```{r setup, include=FALSE}
+options(stringsAsFactors = FALSE)
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(openxlsx)
+  library(ggplot2)
+})
+
+input_file <- "000.input16S.Rds"
+d14_feature_file <- "000.D14_associated_bacteria.csv"
+bcell_feature_file <- "000.B_cell_reconstitution_associated_bacteria.csv"
+
+analysis_name <- "07.outcomeM1_AUC"
+output_root <- analysis_name
+dir.create(output_root, recursive = TRUE, showWarnings = FALSE)
+
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.path = file.path(output_root, "knitr_figures", "")
+)
+```
+
+# 1. Adjustable parameters and model definitions
+
+```{r parameters}
+train_time <- "001_BL"
+valid_times <- c("002_D0", "003_D14")
+all_times <- c(train_time, valid_times)
+
+score_high_class <- "early"
+score_other_class <- setdiff(c("early", "later"), score_high_class)
+positive_class <- score_high_class
+random_seed <- 20260712
+bootstrap_iterations <- 2000
+permutation_iterations <- 5000
+
+# Select any subset of these model IDs when a partial rerun is needed.
+models_to_run <- c(
+  "D14_associated",
+  "B_cell_reconstitution",
+  "Union_set"
+)
+```
+
+# 2. Input preparation
+
+```{r prepare-input}
+required_files <- c(input_file, d14_feature_file, bcell_feature_file)
+missing_files <- required_files[!file.exists(required_files)]
+if (length(missing_files) > 0L) {
+  stop("Missing input file(s): ", paste(missing_files, collapse = ", "))
+}
+
+input16S <- readRDS(input_file)
+if (!is.list(input16S) || !all(c("dat_rela", "metainfo") %in% names(input16S))) {
+  stop("000.input16S.Rds must contain dat_rela and metainfo.")
+}
+
+dat_rela <- input16S$dat_rela
+metainfo <- input16S$metainfo
+d14_features <- utils::read.csv(d14_feature_file, check.names = FALSE)
+bcell_features <- utils::read.csv(bcell_feature_file, check.names = FALSE)
+
+required_metadata <- c("Sample_Name", "timeIDcontiue", "outcome_M1")
+missing_metadata <- setdiff(required_metadata, names(metainfo))
+if (length(missing_metadata) > 0L) {
+  stop("Missing metadata column(s): ", paste(missing_metadata, collapse = ", "))
+}
+if (!"Names" %in% names(d14_features) || !"Names" %in% names(bcell_features)) {
+  stop("Each feature input must contain a Names column.")
+}
+if (!identical(colnames(dat_rela), as.character(metainfo$Sample_Name))) {
+  stop("dat_rela columns are not aligned with metainfo$Sample_Name.")
+}
+
+metadata_select <- metainfo |>
+  dplyr::filter(.data$timeIDcontiue %in% all_times) |>
+  dplyr::mutate(
+    Sample_Name = as.character(.data$Sample_Name),
+    ResponseM1 = dplyr::case_when(
+      .data$outcome_M1 == "Fast_responders" ~ "early",
+      .data$outcome_M1 == "Delayed_responders" ~ "later",
+      TRUE ~ NA_character_
+    ),
+    ResponseM1 = factor(.data$ResponseM1, levels = c("early", "later"))
+  ) |>
+  dplyr::filter(!is.na(.data$ResponseM1))
+
+d14_bacteria <- intersect(unique(d14_features$Names), rownames(dat_rela))
+bcell_bacteria <- intersect(unique(bcell_features$Names), rownames(dat_rela))
+union_bacteria <- intersect(
+  unique(c(d14_features$Names, bcell_features$Names)),
+  rownames(dat_rela)
+)
+
+model_specifications <- list(
+  D14_associated = list(
+    folder = "01_D14_associated_score_model",
+    display_name = "D14-associated score model",
+    feature_source = "D14-associated LEfSe bacteria",
+    bacteria = d14_bacteria
+  ),
+  B_cell_reconstitution = list(
+    folder = "02_B_cell_reconstitution_associated_score_model",
+    display_name = "B-cell reconstitution-associated score model",
+    feature_source = "B-cell reconstitution-associated LEfSe bacteria",
+    bacteria = bcell_bacteria
+  ),
+  Union_set = list(
+    folder = "03_Union_set_score_model",
+    display_name = "Union-set score model",
+    feature_source = "Union of D14-associated and B-cell reconstitution-associated bacteria",
+    bacteria = union_bacteria
+  )
+)
+
+unknown_model_ids <- setdiff(models_to_run, names(model_specifications))
+if (length(unknown_model_ids) > 0L) {
+  stop("Unknown model ID(s): ", paste(unknown_model_ids, collapse = ", "))
+}
+
+feature_summary <- data.frame(
+  model_id = names(model_specifications),
+  input_features = c(
+    length(d14_bacteria),
+    length(bcell_bacteria),
+    length(union_bacteria)
+  )
+)
+
+sample_summary <- metadata_select |>
+  dplyr::count(.data$timeIDcontiue, .data$ResponseM1, name = "n")
+
+feature_summary
+sample_summary
+```
+
+# 3. Modeling utilities
+
+```{r modeling-functions}
+as_numeric_matrix <- function(data) {
+  data <- as.matrix(data)
+  storage.mode(data) <- "numeric"
+  data
+}
+
+get_bacteria_pseudocount <- function(data) {
+  nonzero <- data[is.finite(data) & data > 0]
+  ifelse(length(nonzero) > 0L, min(nonzero) / 2, 1e-6)
+}
+
+get_timepoint_data <- function(timepoint, bacteria) {
+  metadata_timepoint <- metadata_select |>
+    dplyr::filter(.data$timeIDcontiue == timepoint)
+
+  sample_ids <- metadata_timepoint$Sample_Name
+  bacteria_raw <- t(
+    as_numeric_matrix(
+      dat_rela[bacteria, sample_ids, drop = FALSE]
+    )
+  )
+  rownames(bacteria_raw) <- sample_ids
+
+  list(meta = metadata_timepoint, bacteria_raw = bacteria_raw)
+}
+
+get_direction <- function(train_z, y_train, high_class = score_high_class) {
+  valid_classes <- c("early", "later")
+  if (!high_class %in% valid_classes) {
+    stop("score_high_class must be either 'early' or 'later'.")
+  }
+  other_class <- setdiff(valid_classes, high_class)
+
+  median_high <- apply(
+    train_z[y_train == high_class, , drop = FALSE],
+    2,
+    stats::median,
+    na.rm = TRUE
+  )
+  median_other <- apply(
+    train_z[y_train == other_class, , drop = FALSE],
+    2,
+    stats::median,
+    na.rm = TRUE
+  )
+  direction <- sign(median_high - median_other)
+  direction[!is.finite(direction)] <- 0
+  direction
+}
+
+fit_bacteria_score_model <- function(train_x, y_train) {
+  keep_available <- apply(
+    train_x,
+    2,
+    function(values) {
+      sum(!is.na(values)) >= 4L &&
+        length(unique(values[!is.na(values)])) > 1L
+    }
+  )
+  train_x <- train_x[, keep_available, drop = FALSE]
+
+  center <- apply(train_x, 2, stats::median, na.rm = TRUE)
+  spread <- apply(train_x, 2, stats::IQR, na.rm = TRUE)
+  keep_variable <- is.finite(center) & is.finite(spread) & spread > 0
+  train_x <- train_x[, keep_variable, drop = FALSE]
+  center <- center[keep_variable]
+  spread <- spread[keep_variable]
+
+  train_z <- sweep(sweep(train_x, 2, center, "-"), 2, spread, "/")
+  direction <- get_direction(train_z, y_train)
+  keep_direction <- direction != 0
+
+  if (!any(keep_direction)) {
+    stop("No usable model features remain after filtering and direction assignment.")
+  }
+
+  list(
+    score_type = "bacteria",
+    features = colnames(train_z)[keep_direction],
+    center = center[keep_direction],
+    spread = spread[keep_direction],
+    direction = direction[keep_direction],
+    n_feature = sum(keep_direction)
+  )
+}
+
+predict_bacteria_score <- function(model, new_x) {
+  missing_features <- setdiff(model$features, colnames(new_x))
+  if (length(missing_features) > 0L) {
+    added <- matrix(
+      NA_real_,
+      nrow = nrow(new_x),
+      ncol = length(missing_features),
+      dimnames = list(rownames(new_x), missing_features)
+    )
+    new_x <- cbind(new_x, added)
+  }
+  new_x <- new_x[, model$features, drop = FALSE]
+  new_z <- sweep(sweep(new_x, 2, model$center, "-"), 2, model$spread, "/")
+  rowMeans(sweep(new_z, 2, model$direction, "*"), na.rm = TRUE)
+}
+
+calculate_auc <- function(score, outcome, positive = positive_class) {
+  complete <- !is.na(score) & !is.na(outcome)
+  score <- score[complete]
+  outcome <- outcome[complete]
+  positive_score <- score[outcome == positive]
+  negative_score <- score[outcome != positive]
+  if (length(positive_score) < 1L || length(negative_score) < 1L) {
+    return(NA_real_)
+  }
+  comparison <- outer(positive_score, negative_score, "-")
+  (
+    sum(comparison > 0) + 0.5 * sum(comparison == 0)
+  ) / (length(positive_score) * length(negative_score))
+}
+
+auc_bootstrap_ci <- function(score, outcome, B = bootstrap_iterations) {
+  complete <- !is.na(score) & !is.na(outcome)
+  score <- score[complete]
+  outcome <- outcome[complete]
+  positive_ids <- which(outcome == positive_class)
+  negative_ids <- which(outcome != positive_class)
+  if (length(positive_ids) < 1L || length(negative_ids) < 1L) {
+    return(c(NA_real_, NA_real_))
+  }
+
+  bootstrap_auc <- replicate(B, {
+    sampled_ids <- c(
+      sample(positive_ids, length(positive_ids), replace = TRUE),
+      sample(negative_ids, length(negative_ids), replace = TRUE)
+    )
+    calculate_auc(
+      score[sampled_ids],
+      outcome[sampled_ids],
+      positive = positive_class
+    )
+  })
+  stats::quantile(bootstrap_auc, c(0.025, 0.975), na.rm = TRUE)
+}
+
+auc_permutation_p <- function(score, outcome, B = permutation_iterations) {
+  observed <- calculate_auc(score, outcome, positive = positive_class)
+  if (is.na(observed)) {
+    return(NA_real_)
+  }
+  null_auc <- replicate(
+    B,
+    calculate_auc(score, sample(outcome), positive = positive_class)
+  )
+  (
+    sum(abs(null_auc - 0.5) >= abs(observed - 0.5), na.rm = TRUE) + 1
+  ) / (B + 1)
+}
+
+roc_points <- function(score, outcome, score_name, timepoint) {
+  complete <- !is.na(score) & !is.na(outcome)
+  score <- score[complete]
+  outcome <- outcome[complete]
+  thresholds <- c(Inf, sort(unique(score), decreasing = TRUE), -Inf)
+
+  dplyr::bind_rows(lapply(thresholds, function(threshold) {
+    prediction <- score >= threshold
+    true_positive <- sum(prediction & outcome == positive_class)
+    false_positive <- sum(prediction & outcome != positive_class)
+    false_negative <- sum(!prediction & outcome == positive_class)
+    true_negative <- sum(!prediction & outcome != positive_class)
+
+    data.frame(
+      threshold = threshold,
+      sensitivity = ifelse(
+        true_positive + false_negative > 0,
+        true_positive / (true_positive + false_negative),
+        NA_real_
+      ),
+      specificity = ifelse(
+        true_negative + false_positive > 0,
+        true_negative / (true_negative + false_positive),
+        NA_real_
+      ),
+      score_type = score_name,
+      timepoint = timepoint
+    )
+  }))
+}
+
+make_auc_row <- function(timepoint, score, outcome, validation_type, n_feature) {
+  confidence_interval <- auc_bootstrap_ci(score, outcome)
+  data.frame(
+    score_type = "bacteria",
+    timepoint = timepoint,
+    validation_type = validation_type,
+    n_total = sum(!is.na(score) & !is.na(outcome)),
+    n_early = sum(!is.na(score) & outcome == "early"),
+    n_later = sum(!is.na(score) & outcome == "later"),
+    n_feature = n_feature,
+    AUC = calculate_auc(score, outcome, positive = positive_class),
+    CI_low = as.numeric(confidence_interval[1]),
+    CI_high = as.numeric(confidence_interval[2]),
+    permutation_P = auc_permutation_p(score, outcome)
+  )
+}
+
+format_p <- function(p_value) {
+  ifelse(
+    is.na(p_value),
+    "P=NA",
+    ifelse(p_value < 0.001, "P<0.001", sprintf("P=%.3f", p_value))
+  )
+}
+```
+
+# 4. Run one model configuration
+
+```{r run-model-function}
+run_score_model <- function(model_id, specification) {
+  # Resetting the original seed makes each configuration reproducible as a
+  # standalone run of the source workflow.
+  set.seed(random_seed)
+
+  bacteria <- specification$bacteria
+  if (length(bacteria) == 0L) {
+    stop("No input bacteria remain for model: ", model_id)
+  }
+
+  model_dir <- file.path(output_root, specification$folder)
+  figure_dir <- file.path(model_dir, "figures")
+  dir.create(model_dir, recursive = TRUE, showWarnings = FALSE)
+  dir.create(figure_dir, recursive = TRUE, showWarnings = FALSE)
+
+  train_data <- get_timepoint_data(train_time, bacteria)
+  y_train <- train_data$meta$ResponseM1
+  bacteria_pseudocount_M0 <- get_bacteria_pseudocount(train_data$bacteria_raw)
+  train_x <- log10(train_data$bacteria_raw + bacteria_pseudocount_M0)
+
+  baseline_model <- fit_bacteria_score_model(train_x, y_train)
+  train_score_apparent <- predict_bacteria_score(baseline_model, train_x)
+
+  train_score_LOOCV <- rep(NA_real_, length(y_train))
+  n_feature_LOOCV <- rep(NA_integer_, length(y_train))
+
+  for (index in seq_along(y_train)) {
+    training_ids <- setdiff(seq_along(y_train), index)
+    raw_training <- train_data$bacteria_raw[training_ids, , drop = FALSE]
+    raw_testing <- train_data$bacteria_raw[index, , drop = FALSE]
+    pseudocount_fold <- get_bacteria_pseudocount(raw_training)
+    x_training <- log10(raw_training + pseudocount_fold)
+    x_testing <- log10(raw_testing + pseudocount_fold)
+    model_fold <- fit_bacteria_score_model(x_training, y_train[training_ids])
+    train_score_LOOCV[index] <- predict_bacteria_score(model_fold, x_testing)
+    n_feature_LOOCV[index] <- model_fold$n_feature
+  }
+
+  score_list <- list()
+  auc_list <- list()
+  sample_count_list <- list()
+  roc_list <- list()
+
+  score_list[[train_time]] <- data.frame(
+    timepoint = train_time,
+    Sample_Name = train_data$meta$Sample_Name,
+    ResponseM1 = y_train,
+    bacteria_score_M0_model = train_score_apparent,
+    bacteria_score_M0_LOOCV = train_score_LOOCV
+  )
+  auc_list[[paste0(train_time, "_apparent")]] <- make_auc_row(
+    train_time,
+    train_score_apparent,
+    y_train,
+    "M0_apparent_fixed_model",
+    baseline_model$n_feature
+  )
+  auc_list[[paste0(train_time, "_LOOCV")]] <- make_auc_row(
+    train_time,
+    train_score_LOOCV,
+    y_train,
+    "M0_LOOCV_internal",
+    stats::median(n_feature_LOOCV, na.rm = TRUE)
+  )
+  sample_count_list[[train_time]] <- data.frame(
+    timepoint = train_time,
+    n_included = nrow(train_data$meta),
+    n_early = sum(y_train == "early"),
+    n_later = sum(y_train == "later")
+  )
+  roc_list[[paste0(train_time, "_apparent")]] <- roc_points(
+    train_score_apparent,
+    y_train,
+    "bacteria_apparent",
+    train_time
+  )
+  roc_list[[paste0(train_time, "_LOOCV")]] <- roc_points(
+    train_score_LOOCV,
+    y_train,
+    "bacteria_LOOCV",
+    train_time
+  )
+
+  for (timepoint in valid_times) {
+    validation_data <- get_timepoint_data(timepoint, bacteria)
+    y_validation <- validation_data$meta$ResponseM1
+    x_validation <- log10(
+      validation_data$bacteria_raw + bacteria_pseudocount_M0
+    )
+    validation_score <- predict_bacteria_score(
+      baseline_model,
+      x_validation
+    )
+
+    score_list[[timepoint]] <- data.frame(
+      timepoint = timepoint,
+      Sample_Name = validation_data$meta$Sample_Name,
+      ResponseM1 = y_validation,
+      bacteria_score_M0_model = validation_score,
+      bacteria_score_M0_LOOCV = NA_real_
+    )
+    auc_list[[timepoint]] <- make_auc_row(
+      timepoint,
+      validation_score,
+      y_validation,
+      "external_timepoint_fixed_M0_model",
+      baseline_model$n_feature
+    )
+    sample_count_list[[timepoint]] <- data.frame(
+      timepoint = timepoint,
+      n_included = nrow(validation_data$meta),
+      n_early = sum(y_validation == "early"),
+      n_later = sum(y_validation == "later")
+    )
+    roc_list[[timepoint]] <- roc_points(
+      validation_score,
+      y_validation,
+      "bacteria",
+      timepoint
+    )
+  }
+
+  scores_all <- dplyr::bind_rows(score_list)
+  auc_summary <- dplyr::bind_rows(auc_list)
+  sample_counts <- dplyr::bind_rows(sample_count_list)
+  roc_data <- dplyr::bind_rows(roc_list)
+
+  auc_label_data <- auc_summary |>
+    dplyr::mutate(
+      score_type = dplyr::case_when(
+        .data$validation_type == "M0_apparent_fixed_model" ~ "bacteria_apparent",
+        .data$validation_type == "M0_LOOCV_internal" ~ "bacteria_LOOCV",
+        TRUE ~ "bacteria"
+      ),
+      label_y = dplyr::case_when(
+        .data$validation_type == "M0_apparent_fixed_model" ~ 0.26,
+        .data$validation_type == "M0_LOOCV_internal" ~ 0.06,
+        TRUE ~ 0.06
+      ),
+      label = sprintf(
+        "AUC=%.3f\n95%% CI %.3f-%.3f\n%s",
+        .data$AUC,
+        .data$CI_low,
+        .data$CI_high,
+        format_p(.data$permutation_P)
+      )
+    )
+
+  auc_ci_plot_data <- auc_summary |>
+    dplyr::mutate(
+      analysis_label = dplyr::case_when(
+        .data$validation_type == "M0_apparent_fixed_model" ~ "M0 apparent",
+        .data$validation_type == "M0_LOOCV_internal" ~ "M0 LOOCV",
+        .data$timepoint == "002_D0" ~ "D0 validation",
+        .data$timepoint == "003_D14" ~ "D14 validation",
+        TRUE ~ .data$timepoint
+      ),
+      analysis_label = factor(
+        .data$analysis_label,
+        levels = c(
+          "M0 apparent",
+          "M0 LOOCV",
+          "D0 validation",
+          "D14 validation"
+        )
+      ),
+      label = sprintf(
+        "AUC %.3f, %s",
+        .data$AUC,
+        format_p(.data$permutation_P)
+      )
+    )
+
+  feature_direction <- data.frame(
+    score_type = "bacteria",
+    feature = baseline_model$features,
+    center_M0 = baseline_model$center,
+    IQR_M0 = baseline_model$spread,
+    direction = baseline_model$direction,
+    direction_label = ifelse(
+      baseline_model$direction > 0,
+      paste0("higher_in_", score_high_class),
+      paste0("higher_in_", score_other_class)
+    ),
+    stringsAsFactors = FALSE
+  )
+
+  model_information <- list(
+    model_id = model_id,
+    model_display_name = specification$display_name,
+    train_time = train_time,
+    valid_times = valid_times,
+    score_high_class = score_high_class,
+    positive_class = positive_class,
+    random_seed = random_seed,
+    bootstrap_iterations = bootstrap_iterations,
+    permutation_iterations = permutation_iterations,
+    bacteria_pseudocount_M0 = bacteria_pseudocount_M0,
+    bacteria_features_input = bacteria,
+    model = baseline_model,
+    note = paste(
+      "Only bacteria are used. D0 and D14 use the fixed M0/BL feature set,",
+      "median/IQR scaling and direction."
+    )
+  )
+  saveRDS(
+    model_information,
+    file.path(model_dir, "M0_bacteria_ResponseM1_score_model.rds")
+  )
+
+  notes <- data.frame(
+    item = c(
+      "model_configuration",
+      "training_timepoint",
+      "validation_timepoints",
+      "feature_source",
+      "score_definition",
+      "score_high_class",
+      "positive_class",
+      "important_caution"
+    ),
+    description = c(
+      specification$display_name,
+      "M0 is coded as 001_BL in the metadata.",
+      "D0 and D14 are scored using the fixed M0 bacteria model.",
+      specification$feature_source,
+      paste(
+        "Bacteria abundance is log10(relative abundance + M0 pseudocount),",
+        paste0(
+          "standardized by M0 median/IQR, signed by M0 ",
+          score_high_class,
+          "-vs-",
+          score_other_class,
+          " direction,"
+        ),
+        "then averaged."
+      ),
+      paste0("Higher scores indicate a more ", score_high_class, "-like profile."),
+      paste0(
+        "AUC treats ",
+        positive_class,
+        " as the positive class, consistent with the score direction."
+      ),
+      paste(
+        "D0 and D14 are temporal validation timepoints from the same cohort,",
+        "not independent external validation."
+      )
+    )
+  )
+
+  utils::write.csv(
+    notes,
+    file.path(model_dir, "00_model_notes.csv"),
+    row.names = FALSE,
+    fileEncoding = "UTF-8"
+  )
+  utils::write.csv(
+    scores_all,
+    file.path(model_dir, "01_scores_in_M0_D0_D14.csv"),
+    row.names = FALSE,
+    fileEncoding = "UTF-8"
+  )
+  utils::write.csv(
+    auc_summary,
+    file.path(model_dir, "02_AUC_in_M0_D0_D14.csv"),
+    row.names = FALSE,
+    fileEncoding = "UTF-8"
+  )
+  utils::write.csv(
+    feature_direction,
+    file.path(model_dir, "03_feature_direction.csv"),
+    row.names = FALSE,
+    fileEncoding = "UTF-8"
+  )
+  utils::write.csv(
+    sample_counts,
+    file.path(model_dir, "04_sample_counts.csv"),
+    row.names = FALSE,
+    fileEncoding = "UTF-8"
+  )
+
+  openxlsx::write.xlsx(
+    list(
+      notes = notes,
+      AUC_summary = auc_summary,
+      scores = scores_all,
+      feature_direction = feature_direction,
+      sample_counts = sample_counts
+    ),
+    file.path(model_dir, "M0_bacteria_model_ResponseM1_AUC_summary.xlsx"),
+    overwrite = TRUE
+  )
+
+  plot_title_prefix <- specification$display_name
+
+  roc_plot <- ggplot2::ggplot(
+    roc_data,
+    ggplot2::aes(
+      x = 1 - .data$specificity,
+      y = .data$sensitivity,
+      color = .data$score_type
+    )
+  ) +
+    ggplot2::geom_abline(
+      slope = 1,
+      intercept = 0,
+      linetype = "dashed",
+      color = "grey60"
+    ) +
+    ggplot2::geom_step(linewidth = 0.8) +
+    ggplot2::geom_label(
+      data = auc_label_data,
+      ggplot2::aes(
+        x = 0.03,
+        y = .data$label_y,
+        label = .data$label,
+        color = .data$score_type
+      ),
+      inherit.aes = FALSE,
+      hjust = 0,
+      vjust = 0,
+      size = 2.6,
+      linewidth = 0.2,
+      fill = "white",
+      alpha = 0.9,
+      show.legend = FALSE
+    ) +
+    ggplot2::coord_equal() +
+    ggplot2::facet_wrap(~timepoint) +
+    ggplot2::theme_bw(base_size = 11) +
+    ggplot2::labs(
+      x = "1 - specificity",
+      y = "sensitivity",
+      color = "score",
+      title = paste0(plot_title_prefix, ": ResponseM1 ROC")
+    )
+
+  ggplot2::ggsave(
+    file.path(figure_dir, "Figure_01_ROC_in_M0_D0_D14.pdf"),
+    roc_plot,
+    width = 8,
+    height = 4.5
+  )
+
+  auc_ci_plot <- ggplot2::ggplot(
+    auc_ci_plot_data,
+    ggplot2::aes(x = .data$analysis_label, y = .data$AUC)
+  ) +
+    ggplot2::geom_hline(
+      yintercept = 0.5,
+      linetype = "dashed",
+      color = "grey60"
+    ) +
+    ggplot2::geom_pointrange(
+      ggplot2::aes(ymin = .data$CI_low, ymax = .data$CI_high),
+      linewidth = 0.7,
+      size = 0.8,
+      color = "#2563EB"
+    ) +
+    ggplot2::geom_text(
+      ggplot2::aes(label = .data$label),
+      hjust = -0.05,
+      size = 3.2
+    ) +
+    ggplot2::coord_flip(ylim = c(0, 1.08), clip = "off") +
+    ggplot2::theme_bw(base_size = 11) +
+    ggplot2::theme(
+      plot.margin = ggplot2::margin(5.5, 50, 5.5, 5.5)
+    ) +
+    ggplot2::labs(
+      x = NULL,
+      y = "AUC with bootstrap 95% CI",
+      title = paste0(plot_title_prefix, ": AUC")
+    )
+
+  ggplot2::ggsave(
+    file.path(figure_dir, "Figure_02_AUC_CI_in_M0_D0_D14.pdf"),
+    auc_ci_plot,
+    width = 7,
+    height = 4
+  )
+
+  score_plot_data <- scores_all |>
+    dplyr::mutate(
+      plot_score = ifelse(
+        .data$timepoint == train_time,
+        .data$bacteria_score_M0_LOOCV,
+        .data$bacteria_score_M0_model
+      ),
+      score_version = ifelse(
+        .data$timepoint == train_time,
+        "M0_LOOCV",
+        "fixed_M0_model"
+      )
+    )
+
+  score_boxplot <- ggplot2::ggplot(
+    score_plot_data,
+    ggplot2::aes(
+      x = .data$ResponseM1,
+      y = .data$plot_score,
+      fill = .data$ResponseM1
+    )
+  ) +
+    ggplot2::geom_boxplot(
+      width = 0.55,
+      outlier.shape = NA,
+      alpha = 0.65
+    ) +
+    ggplot2::geom_jitter(width = 0.12, size = 1.8, alpha = 0.85) +
+    ggplot2::facet_wrap(~timepoint, scales = "free_y") +
+    ggplot2::theme_bw(base_size = 11) +
+    ggplot2::theme(legend.position = "none") +
+    ggplot2::labs(
+      x = NULL,
+      y = "Bacteria score",
+      title = paste0(plot_title_prefix, ": scores in M0, D0 and D14")
+    )
+
+  ggplot2::ggsave(
+    file.path(figure_dir, "Figure_03_score_boxplot_in_M0_D0_D14.pdf"),
+    score_boxplot,
+    width = 8,
+    height = 4.5
+  )
+
+  list(
+    model_id = model_id,
+    display_name = specification$display_name,
+    model_dir = model_dir,
+    input_feature_count = length(bacteria),
+    fitted_feature_count = baseline_model$n_feature,
+    AUC_summary = auc_summary,
+    sample_counts = sample_counts,
+    ROC_plot = roc_plot,
+    AUC_CI_plot = auc_ci_plot,
+    score_boxplot = score_boxplot
+  )
+}
+```
+
+# 5. Run the selected model configurations
+
+```{r run-all-models}
+model_results <- lapply(models_to_run, function(model_id) {
+  run_score_model(model_id, model_specifications[[model_id]])
+})
+names(model_results) <- models_to_run
+
+combined_auc_summary <- dplyr::bind_rows(lapply(
+  model_results,
+  function(result) {
+    result$AUC_summary |>
+      dplyr::mutate(
+        model_id = result$model_id,
+        model_name = result$display_name,
+        input_feature_count = result$input_feature_count,
+        fitted_feature_count = result$fitted_feature_count,
+        .before = 1
+      )
+  }
+))
+
+utils::write.csv(
+  combined_auc_summary,
+  file.path(output_root, "00_three_model_AUC_summary.csv"),
+  row.names = FALSE,
+  fileEncoding = "UTF-8"
+)
+
+combined_auc_summary
+```
+
+# 6. Model figures
+
+## 6.1 D14-associated score model
+
+```{r show-d14-model-figures, fig.width=8, fig.height=4.5}
+if ("D14_associated" %in% names(model_results)) {
+  print(model_results$D14_associated$ROC_plot)
+  print(model_results$D14_associated$AUC_CI_plot)
+  print(model_results$D14_associated$score_boxplot)
+}
+```
+
+## 6.2 B-cell reconstitution-associated score model
+
+```{r show-bcell-model-figures, fig.width=8, fig.height=4.5}
+if ("B_cell_reconstitution" %in% names(model_results)) {
+  print(model_results$B_cell_reconstitution$ROC_plot)
+  print(model_results$B_cell_reconstitution$AUC_CI_plot)
+  print(model_results$B_cell_reconstitution$score_boxplot)
+}
+```
+
+## 6.3 Union-set score model
+
+```{r show-union-model-figures, fig.width=8, fig.height=4.5}
+if ("Union_set" %in% names(model_results)) {
+  print(model_results$Union_set$ROC_plot)
+  print(model_results$Union_set$AUC_CI_plot)
+  print(model_results$Union_set$score_boxplot)
+}
+```
+
+# 7. Session information
+
+```{r session-information}
+sessionInfo()
+```

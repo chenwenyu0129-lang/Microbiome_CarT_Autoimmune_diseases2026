@@ -1,0 +1,644 @@
+---
+title: "16S Bray-Curtis distances and sample-characteristic distributions"
+output:
+  html_document:
+    toc: true
+    number_sections: true
+    self_contained: true
+---
+
+This analysis characterizes Bray-Curtis distances across longitudinal time
+points and summarizes the distributions of selected sample and clinical
+characteristics. Six figures are generated using predefined group orders,
+Wilcoxon tests, color palettes, dimensions, and random seed.
+
+```{r setup, include=FALSE}
+options(stringsAsFactors = FALSE)
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(ggplot2)
+  library(scales)
+  library(vegan)
+})
+
+input_file <- "000.input16S.Rds"
+analysis_name <- "04.16s_BrayCurtis_and_metadata_distributions"
+output_root <- analysis_name
+figure_dir <- file.path(output_root, "figures")
+table_dir <- file.path(output_root, "tables")
+
+dir.create(output_root, recursive = TRUE, showWarnings = FALSE)
+dir.create(figure_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(table_dir, recursive = TRUE, showWarnings = FALSE)
+
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.path = file.path(output_root, "knitr_figures", "")
+)
+
+# Parameters retained from the source analysis.
+set.seed(20260529)
+timepoint_order <- c("BL", "D0", "D14", "M1", "M2", "M3", "M4", "M5", "M6")
+all_distance_groups <- c("BL", "D0", "D14", "M1", "M2", "M3", "M6")
+broad_abx_distance_groups <- c("D0", "D14", "M1", "M2")
+```
+
+# 1. Reusable functions
+
+```{r functions}
+write_table <- function(data, filename) {
+  utils::write.csv(
+    data,
+    file.path(table_dir, filename),
+    row.names = FALSE,
+    na = ""
+  )
+}
+
+make_count_table <- function(metadata, variable, category_levels) {
+  metadata |>
+    dplyr::transmute(
+      group_label = .data$group_label,
+      category = factor(.data[[variable]], levels = category_levels)
+    ) |>
+    dplyr::filter(!is.na(.data$group_label), !is.na(.data$category)) |>
+    dplyr::count(.data$group_label, .data$category, name = "n") |>
+    dplyr::group_by(.data$group_label) |>
+    dplyr::mutate(proportion = .data$n / sum(.data$n)) |>
+    dplyr::ungroup()
+}
+
+plot_count_distribution <- function(count_table, palette, title, legend_title) {
+  ggplot2::ggplot(
+    count_table,
+    ggplot2::aes(x = .data$group_label, y = .data$proportion, fill = .data$category)
+  ) +
+    ggplot2::geom_col(width = 0.72, colour = "white", linewidth = 0.3) +
+    ggplot2::geom_text(
+      ggplot2::aes(label = ifelse(.data$n > 0, .data$n, "")),
+      position = ggplot2::position_stack(vjust = 0.5),
+      size = 3.1,
+      colour = "white",
+      fontface = "bold",
+      family = "ArialMT"
+    ) +
+    ggplot2::scale_fill_manual(values = palette, drop = FALSE) +
+    ggplot2::scale_y_continuous(
+      labels = scales::percent_format(accuracy = 1),
+      expand = ggplot2::expansion(mult = c(0, 0.04))
+    ) +
+    ggplot2::labs(
+      x = NULL,
+      y = "Proportion of samples",
+      title = title,
+      fill = legend_title
+    ) +
+    ggplot2::theme_bw() +
+    ggplot2::theme(
+      text = ggplot2::element_text(family = "ArialMT"),
+      panel.grid = ggplot2::element_blank(),
+      plot.title = ggplot2::element_text(face = "bold", hjust = 0.5, size = 12),
+      legend.position = "top"
+    )
+}
+
+extract_within_group_distances <- function(
+    metadata,
+    distance_matrix,
+    groups,
+    stratification_variable = NULL) {
+  output <- list()
+  output_index <- 1L
+
+  for (group_name in groups) {
+    group_metadata <- metadata |>
+      dplyr::filter(.data$group_label == group_name)
+
+    stratum_values <- if (is.null(stratification_variable)) {
+      NA_character_
+    } else {
+      unique(as.character(group_metadata[[stratification_variable]]))
+    }
+
+    for (stratum_value in stratum_values) {
+      subgroup_metadata <- if (is.null(stratification_variable)) {
+        group_metadata
+      } else {
+        group_metadata |>
+          dplyr::filter(.data[[stratification_variable]] == stratum_value)
+      }
+
+      sample_ids <- subgroup_metadata$sample_id
+      if (length(sample_ids) < 2L) {
+        next
+      }
+
+      subgroup_matrix <- distance_matrix[
+        sample_ids,
+        sample_ids,
+        drop = FALSE
+      ]
+      lower_triangle <- lower.tri(subgroup_matrix)
+
+      output[[output_index]] <- data.frame(
+        group_label = group_name,
+        stratum = stratum_value,
+        BC_distance = subgroup_matrix[lower_triangle],
+        stringsAsFactors = FALSE
+      )
+      output_index <- output_index + 1L
+    }
+  }
+
+  dplyr::bind_rows(output)
+}
+
+safe_wilcox_p <- function(x, y) {
+  if (length(x) == 0L || length(y) == 0L) {
+    return(NA_real_)
+  }
+  suppressWarnings(stats::wilcox.test(x, y)$p.value)
+}
+
+format_plot_p <- function(p) {
+  if (is.na(p)) {
+    return("NA")
+  }
+  if (p < 1e-4) {
+    return(format(signif(p, 2), scientific = TRUE, trim = TRUE))
+  }
+  format(signif(p, 2), scientific = FALSE, trim = TRUE)
+}
+
+significance_symbol <- function(p) {
+  dplyr::case_when(
+    is.na(p) ~ "NA",
+    p <= 1e-4 ~ "****",
+    p <= 1e-3 ~ "***",
+    p <= 1e-2 ~ "**",
+    p <= 5e-2 ~ "*",
+    TRUE ~ "ns"
+  )
+}
+```
+
+# 2. Input preparation and Bray-Curtis distance
+
+```{r prepare-input}
+if (!file.exists(input_file)) {
+  stop("Input file not found: ", input_file)
+}
+
+input16S <- readRDS(input_file)
+if (!is.list(input16S) || !all(c("dat_rela", "metainfo") %in% names(input16S))) {
+  stop("000.input16S.Rds must contain dat_rela and metainfo.")
+}
+
+dat_rela <- input16S$dat_rela
+metainfo <- input16S$metainfo
+
+required_metadata <- c(
+  "Sample_Name", "timeIDcontiue", "batch", "Disease",
+  "abx_recent", "broad_abx_14d"
+)
+missing_metadata <- setdiff(required_metadata, names(metainfo))
+if (length(missing_metadata) > 0L) {
+  stop("Missing metadata column(s): ", paste(missing_metadata, collapse = ", "))
+}
+if (!identical(colnames(dat_rela), as.character(metainfo$Sample_Name))) {
+  stop("dat_rela columns are not aligned with metainfo$Sample_Name.")
+}
+
+metadata_select <- metainfo |>
+  dplyr::transmute(
+    sample_id = as.character(.data$Sample_Name),
+    group_label = factor(
+      sub("^[0-9]+_", "", .data$timeIDcontiue),
+      levels = timepoint_order
+    ),
+    batch = factor(.data$batch, levels = c("batch1", "batch2")),
+    Disease = factor(.data$Disease, levels = c("ANCA", "IIM", "SjD", "SLE", "SSc")),
+    abx_recent = factor(.data$abx_recent, levels = c("No", "Yes")),
+    broad_abx_14d = factor(.data$broad_abx_14d, levels = c("No", "Yes"))
+  ) |>
+  dplyr::filter(!is.na(.data$group_label)) |>
+  droplevels()
+
+dat_rela_select <- dat_rela[, metadata_select$sample_id, drop = FALSE]
+dat_rela_select <- dat_rela_select[rowSums(dat_rela_select) > 0, , drop = FALSE]
+
+abundance_matrix <- t(dat_rela_select)
+bray_curtis_distance <- vegan::vegdist(abundance_matrix, method = "bray")
+distance_matrix <- as.matrix(bray_curtis_distance)
+
+data.frame(
+  selected_samples = nrow(metadata_select),
+  retained_taxa = nrow(dat_rela_select),
+  timepoints = nlevels(metadata_select$group_label)
+)
+```
+
+# 3. Sample-characteristic distributions
+
+```{r distribution-data}
+recent_palette <- c("No" = "#969696", "Yes" = "#c45c1a")
+broad_palette <- c("No" = "#969696", "Yes" = "#c45c1a")
+batch_palette <- c("batch1" = "#1F77B4", "batch2" = "tomato3")
+disease_palette <- c(
+  "ANCA" = "grey",
+  "IIM" = "#2CA02C",
+  "SjD" = "#1F77B4",
+  "SLE" = "#D62728",
+  "SSc" = "#9467BD"
+)
+
+recent_count_table <- make_count_table(
+  metadata_select,
+  "abx_recent",
+  c("No", "Yes")
+)
+broad_count_table <- make_count_table(
+  metadata_select,
+  "broad_abx_14d",
+  c("No", "Yes")
+)
+batch_count_table <- make_count_table(
+  metadata_select,
+  "batch",
+  c("batch1", "batch2")
+)
+disease_count_table <- make_count_table(
+  metadata_select,
+  "Disease",
+  c("ANCA", "IIM", "SjD", "SLE", "SSc")
+)
+
+write_table(recent_count_table, "recent_antibiotic_exposure_counts.csv")
+write_table(broad_count_table, "recent_broad_spectrum_antibiotic_exposure_counts.csv")
+write_table(batch_count_table, "sequencing_batch_counts.csv")
+write_table(disease_count_table, "disease_category_counts.csv")
+```
+
+## 3.1 Recent antibiotic exposure
+
+```{r recent-antibiotic-plot, fig.width=7.02, fig.height=3.39}
+p_recent_antibiotic <- plot_count_distribution(
+  recent_count_table,
+  recent_palette,
+  "Recent antibiotic exposure by time window",
+  "Recent antibiotic exposure"
+)
+
+ggplot2::ggsave(
+  file.path(figure_dir, "recent_antibiotic_exposure_by_timepoint.pdf"),
+  p_recent_antibiotic,
+  width = 7.02,
+  height = 3.39
+)
+
+p_recent_antibiotic
+```
+
+## 3.2 Recent broad-spectrum antibiotic exposure
+
+```{r recent-broad-antibiotic-plot, fig.width=7.02, fig.height=3.39}
+p_recent_broad_antibiotic <- plot_count_distribution(
+  broad_count_table,
+  broad_palette,
+  "Broad-spectrum antibiotic exposure (14d) by time window",
+  "Broad-spectrum antibiotic exposure (14d)"
+)
+
+ggplot2::ggsave(
+  file.path(figure_dir, "recent_broad_spectrum_antibiotic_exposure_by_timepoint.pdf"),
+  p_recent_broad_antibiotic,
+  width = 7.02,
+  height = 3.39
+)
+
+p_recent_broad_antibiotic
+```
+
+## 3.3 Sequencing batch
+
+```{r sequencing-batch-plot, fig.width=7.02, fig.height=3.39}
+p_sequencing_batch <- plot_count_distribution(
+  batch_count_table,
+  batch_palette,
+  "Sequencing batch by time window",
+  "Sequencing batch"
+)
+
+ggplot2::ggsave(
+  file.path(figure_dir, "sequencing_batch_distribution_by_timepoint.pdf"),
+  p_sequencing_batch,
+  width = 7.02,
+  height = 3.39
+)
+
+p_sequencing_batch
+```
+
+## 3.4 Disease category
+
+```{r disease-category-plot, fig.width=7.02, fig.height=3.39}
+p_disease <- plot_count_distribution(
+  disease_count_table,
+  disease_palette,
+  "Disease category by time window",
+  "Disease"
+)
+
+ggplot2::ggsave(
+  file.path(figure_dir, "disease_distribution_by_timepoint.pdf"),
+  p_disease,
+  width = 7.02,
+  height = 3.39
+)
+
+p_disease
+```
+
+# 4. Bray-Curtis distance by broad-spectrum antibiotic exposure
+
+Pairwise distances are calculated within each timepoint and antibiotic-exposure
+stratum. The Wilcoxon test and original grey/tomato palette are retained.
+
+```{r broad-antibiotic-distance-data}
+broad_abx_distance_data <- extract_within_group_distances(
+  metadata_select,
+  distance_matrix,
+  broad_abx_distance_groups,
+  stratification_variable = "broad_abx_14d"
+) |>
+  dplyr::mutate(
+    group_label = factor(.data$group_label, levels = broad_abx_distance_groups),
+    broad_abx_14d = factor(.data$stratum, levels = c("No", "Yes"))
+  )
+
+broad_abx_tests <- lapply(broad_abx_distance_groups, function(group_name) {
+  group_data <- broad_abx_distance_data |>
+    dplyr::filter(.data$group_label == group_name)
+  no_distances <- group_data$BC_distance[group_data$broad_abx_14d == "No"]
+  yes_distances <- group_data$BC_distance[group_data$broad_abx_14d == "Yes"]
+  p_value <- safe_wilcox_p(no_distances, yes_distances)
+
+  data.frame(
+    group_label = group_name,
+    no_pairwise_distances = length(no_distances),
+    yes_pairwise_distances = length(yes_distances),
+    median_no = if (length(no_distances) > 0L) stats::median(no_distances) else NA_real_,
+    median_yes = if (length(yes_distances) > 0L) stats::median(yes_distances) else NA_real_,
+    P_value = p_value,
+    significance = significance_symbol(p_value),
+    stringsAsFactors = FALSE
+  )
+}) |>
+  dplyr::bind_rows() |>
+  dplyr::mutate(
+    group_label = factor(.data$group_label, levels = broad_abx_distance_groups),
+    label_y = vapply(
+      as.character(.data$group_label),
+      function(group_name) {
+        max(
+          broad_abx_distance_data$BC_distance[
+            broad_abx_distance_data$group_label == group_name
+          ],
+          na.rm = TRUE
+        ) * 1.03
+      },
+      numeric(1)
+    )
+  )
+
+write_table(
+  broad_abx_tests |>
+    dplyr::select(-dplyr::all_of("label_y")),
+  "bray_curtis_broad_spectrum_antibiotic_tests.csv"
+)
+```
+
+```{r broad-antibiotic-distance-plot, fig.width=5.30, fig.height=3.39}
+p_broad_abx_distance <- ggplot2::ggplot(
+  broad_abx_distance_data,
+  ggplot2::aes(
+    x = .data$group_label,
+    y = .data$BC_distance,
+    fill = .data$broad_abx_14d
+  )
+) +
+  ggplot2::geom_boxplot(
+    width = 0.6,
+    color = "grey",
+    alpha = 0.85,
+    linewidth = 0.6,
+    position = ggplot2::position_dodge(0.75)
+  ) +
+  ggplot2::geom_text(
+    data = broad_abx_tests,
+    ggplot2::aes(
+      x = .data$group_label,
+      y = .data$label_y,
+      label = .data$significance
+    ),
+    inherit.aes = FALSE,
+    vjust = 0,
+    size = 3.5,
+    family = "ArialMT"
+  ) +
+  ggplot2::scale_fill_manual(values = c("No" = "#969696", "Yes" = "tomato3")) +
+  ggplot2::scale_y_continuous(expand = ggplot2::expansion(mult = c(0.02, 0.12))) +
+  ggplot2::labs(
+    y = "Pairwise within-group Bray-Curtis distance",
+    x = NULL,
+    fill = "14d Broad Abx"
+  ) +
+  ggplot2::theme_bw(base_size = 12) +
+  ggplot2::theme(
+    aspect.ratio = 1,
+    legend.position = "none",
+    legend.title = ggplot2::element_blank(),
+    panel.grid = ggplot2::element_blank(),
+    panel.border = ggplot2::element_rect(fill = NA, colour = "grey87")
+  )
+
+ggplot2::ggsave(
+  file.path(figure_dir, "bray_curtis_distance_by_broad_spectrum_antibiotic.pdf"),
+  p_broad_abx_distance,
+  width = 5.30,
+  height = 3.39
+)
+
+p_broad_abx_distance
+```
+
+# 5. Bray-Curtis distance across the full analysis cycle
+
+The source code generated every within-timepoint distance twice because it
+looped over antibiotic status without filtering on that status. This redundant
+duplication is removed here. The duplicated BL-D14 comparison in the source
+annotation list is also retained only once.
+
+```{r all-timepoint-distance-data}
+all_timepoint_distance_data <- extract_within_group_distances(
+  metadata_select,
+  distance_matrix,
+  all_distance_groups
+) |>
+  dplyr::mutate(
+    group_label = factor(.data$group_label, levels = all_distance_groups)
+  )
+
+all_distance_summary <- all_timepoint_distance_data |>
+  dplyr::group_by(.data$group_label) |>
+  dplyr::summarise(
+    n_pairwise_distances = dplyr::n(),
+    median_BC_distance = stats::median(.data$BC_distance),
+    Q1_BC_distance = stats::quantile(.data$BC_distance, 0.25),
+    Q3_BC_distance = stats::quantile(.data$BC_distance, 0.75),
+    .groups = "drop"
+  )
+
+comparison_definitions <- data.frame(
+  group_1 = c("BL", "D0", "BL", "D14", "M1", "M2", "BL", "BL", "BL"),
+  group_2 = c("D0", "D14", "D14", "M1", "M2", "M3", "M1", "M2", "M3"),
+  height_rank = seq_len(9L),
+  stringsAsFactors = FALSE
+)
+
+distance_range <- diff(range(all_timepoint_distance_data$BC_distance, na.rm = TRUE))
+base_annotation_y <- max(all_timepoint_distance_data$BC_distance, na.rm = TRUE) +
+  0.035 * distance_range
+annotation_step <- 0.09 * distance_range
+
+all_timepoint_tests <- lapply(seq_len(nrow(comparison_definitions)), function(index) {
+  group_1 <- comparison_definitions$group_1[index]
+  group_2 <- comparison_definitions$group_2[index]
+  x <- all_timepoint_distance_data$BC_distance[
+    all_timepoint_distance_data$group_label == group_1
+  ]
+  y <- all_timepoint_distance_data$BC_distance[
+    all_timepoint_distance_data$group_label == group_2
+  ]
+  p_value <- safe_wilcox_p(x, y)
+
+  data.frame(
+    group_1 = group_1,
+    group_2 = group_2,
+    n_pairwise_distances_group_1 = length(x),
+    n_pairwise_distances_group_2 = length(y),
+    P_value = p_value,
+    P_label = format_plot_p(p_value),
+    x_start = match(group_1, all_distance_groups),
+    x_end = match(group_2, all_distance_groups),
+    annotation_y = base_annotation_y + (index - 1L) * annotation_step,
+    stringsAsFactors = FALSE
+  )
+}) |>
+  dplyr::bind_rows()
+
+write_table(all_distance_summary, "bray_curtis_all_timepoints_summary.csv")
+write_table(
+  all_timepoint_tests |>
+    dplyr::select(
+      .data$group_1,
+      .data$group_2,
+      .data$n_pairwise_distances_group_1,
+      .data$n_pairwise_distances_group_2,
+      .data$P_value
+    ),
+  "bray_curtis_all_timepoints_wilcoxon_tests.csv"
+)
+```
+
+```{r all-timepoint-distance-plot, fig.width=5.38, fig.height=4.85}
+bracket_tip <- 0.018 * distance_range
+
+p_all_timepoint_distance <- ggplot2::ggplot(
+  all_timepoint_distance_data,
+  ggplot2::aes(x = .data$group_label, y = .data$BC_distance)
+) +
+  ggplot2::geom_boxplot(
+    width = 0.6,
+    color = "grey",
+    alpha = 0.85,
+    linewidth = 0.6
+  ) +
+  ggplot2::geom_segment(
+    data = all_timepoint_tests,
+    ggplot2::aes(
+      x = .data$x_start,
+      xend = .data$x_end,
+      y = .data$annotation_y,
+      yend = .data$annotation_y
+    ),
+    inherit.aes = FALSE,
+    linewidth = 0.35
+  ) +
+  ggplot2::geom_segment(
+    data = all_timepoint_tests,
+    ggplot2::aes(
+      x = .data$x_start,
+      xend = .data$x_start,
+      y = .data$annotation_y,
+      yend = .data$annotation_y - bracket_tip
+    ),
+    inherit.aes = FALSE,
+    linewidth = 0.35
+  ) +
+  ggplot2::geom_segment(
+    data = all_timepoint_tests,
+    ggplot2::aes(
+      x = .data$x_end,
+      xend = .data$x_end,
+      y = .data$annotation_y,
+      yend = .data$annotation_y - bracket_tip
+    ),
+    inherit.aes = FALSE,
+    linewidth = 0.35
+  ) +
+  ggplot2::geom_text(
+    data = all_timepoint_tests,
+    ggplot2::aes(
+      x = (.data$x_start + .data$x_end) / 2,
+      y = .data$annotation_y,
+      label = .data$P_label
+    ),
+    inherit.aes = FALSE,
+    vjust = -0.25,
+    size = 3.2,
+    family = "ArialMT"
+  ) +
+  ggplot2::scale_y_continuous(
+    expand = ggplot2::expansion(mult = c(0.02, 0.03))
+  ) +
+  ggplot2::labs(
+    y = "Pairwise within-group Bray-Curtis distance",
+    x = NULL
+  ) +
+  ggplot2::theme_bw(base_size = 12) +
+  ggplot2::theme(
+    aspect.ratio = 1,
+    legend.position = "none",
+    panel.grid = ggplot2::element_blank(),
+    panel.border = ggplot2::element_rect(fill = NA, colour = "grey87")
+  )
+
+ggplot2::ggsave(
+  file.path(figure_dir, "bray_curtis_distance_all_timepoints.pdf"),
+  p_all_timepoint_distance,
+  width = 5.38,
+  height = 4.85
+)
+
+p_all_timepoint_distance
+```
+
+# 6. Session information
+
+```{r session-information}
+sessionInfo()
+```

@@ -1,0 +1,395 @@
+---
+title: "Gut bacterial features associated with favorable B-cell subsets"
+output:
+  html_document:
+    toc: true
+    number_sections: true
+    self_contained: true
+---
+
+This analysis evaluates associations between longitudinal gut bacterial
+profiles and the combined proportion of naive B cells, immature B cells, and
+unswitched memory B cells. Samples are stratified at the median B-cell
+proportion for LEfSe and species-level abundance comparisons.
+
+```{r setup, include=FALSE}
+options(stringsAsFactors = FALSE)
+
+suppressPackageStartupMessages({
+  library(lefser)
+  library(SummarizedExperiment)
+  library(dplyr)
+  library(ggplot2)
+  library(ggpubr)
+})
+
+input_file <- "000.input16S.Rds"
+cell_metric_file <- "000.good_B_cell_metrics.csv"
+taxonomy_file <- "000.lefse_taxonomy_annotation.Rds"
+
+analysis_name <- "06.lefse_Bsub_clone"
+output_root <- analysis_name
+figure_dir <- file.path(output_root, "figures")
+table_dir <- file.path(output_root, "tables")
+
+dir.create(output_root, recursive = TRUE, showWarnings = FALSE)
+dir.create(figure_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(table_dir, recursive = TRUE, showWarnings = FALSE)
+
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.path = file.path(output_root, "knitr_figures", "")
+)
+
+excluded_timepoints <- c("001_BL", "002_D0", "003_D14")
+excluded_disease <- "IIM"
+prevalence_fraction <- 0.10
+lefse_seed <- 1234
+
+target_boxplot_species <- c(
+  "s__Blautia_wexlerae",
+  "s__Blautia_caecimuris",
+  "s__Ruminococcus_bromii",
+  "s__Romboutsia_ilealis"
+)
+```
+
+# 1. Input preparation
+
+```{r prepare-input}
+required_files <- c(input_file, cell_metric_file, taxonomy_file)
+missing_files <- required_files[!file.exists(required_files)]
+if (length(missing_files) > 0L) {
+  stop("Missing input file(s): ", paste(missing_files, collapse = ", "))
+}
+
+input16S <- readRDS(input_file)
+if (!is.list(input16S) || !all(c("dat_rela", "metainfo") %in% names(input16S))) {
+  stop("000.input16S.Rds must contain dat_rela and metainfo.")
+}
+
+dat_rela <- input16S$dat_rela
+metainfo <- input16S$metainfo
+cell_metrics <- utils::read.csv(cell_metric_file, check.names = FALSE)
+dat_name <- readRDS(taxonomy_file)
+
+required_metadata <- c("Sample_Name", "Disease", "timeIDcontiue")
+missing_metadata <- setdiff(required_metadata, names(metainfo))
+if (length(missing_metadata) > 0L) {
+  stop("Missing metadata column(s): ", paste(missing_metadata, collapse = ", "))
+}
+required_cell_metrics <- c(
+  "Sample_Name", "Good_B_cell_count",
+  "Total_cell_count", "Good_B_cell_percent"
+)
+missing_cell_metrics <- setdiff(required_cell_metrics, names(cell_metrics))
+if (length(missing_cell_metrics) > 0L) {
+  stop("Missing B-cell metric column(s): ", paste(missing_cell_metrics, collapse = ", "))
+}
+if (!identical(colnames(dat_rela), as.character(metainfo$Sample_Name))) {
+  stop("dat_rela columns are not aligned with metainfo$Sample_Name.")
+}
+if (!"species" %in% names(dat_name)) {
+  stop("The taxonomy annotation must contain a species column.")
+}
+
+metadata_select <- metainfo |>
+  dplyr::left_join(cell_metrics, by = "Sample_Name") |>
+  dplyr::filter(
+    .data$Disease != excluded_disease,
+    !.data$timeIDcontiue %in% excluded_timepoints,
+    is.finite(.data$Good_B_cell_percent)
+  ) |>
+  dplyr::mutate(
+    Sample_Name = as.character(.data$Sample_Name),
+    B_cell_group = ifelse(
+      .data$Good_B_cell_percent > stats::median(.data$Good_B_cell_percent),
+      "more",
+      "less"
+    ),
+    B_cell_group = factor(.data$B_cell_group, levels = c("less", "more"))
+  )
+
+if (nrow(metadata_select) == 0L) {
+  stop("No samples remain after metadata and B-cell filtering.")
+}
+
+dat_rela_select <- dat_rela[, metadata_select$Sample_Name, drop = FALSE]
+dat_rela_select <- dat_rela_select[rowSums(dat_rela_select) > 0, , drop = FALSE]
+
+dat_name <- dat_name[match(rownames(dat_rela_select), dat_name$species), , drop = FALSE]
+if (anyNA(dat_name$species)) {
+  stop("Some abundance rows are missing from the taxonomy annotation.")
+}
+rownames(dat_name) <- dat_name$species
+if (!identical(rownames(dat_name), rownames(dat_rela_select))) {
+  stop("Taxonomy rows are not aligned with the abundance matrix.")
+}
+
+missing_boxplot_species <- setdiff(
+  target_boxplot_species,
+  rownames(dat_rela_select)
+)
+if (length(missing_boxplot_species) > 0L) {
+  stop("Missing boxplot species: ", paste(missing_boxplot_species, collapse = ", "))
+}
+
+rownames(metadata_select) <- metadata_select$Sample_Name
+
+data.frame(
+  samples = nrow(metadata_select),
+  species = nrow(dat_rela_select),
+  median_Good_B_cell_percent = stats::median(metadata_select$Good_B_cell_percent),
+  less_group = sum(metadata_select$B_cell_group == "less"),
+  more_group = sum(metadata_select$B_cell_group == "more")
+)
+```
+
+# 2. Species correlations with the favorable B-cell proportion
+
+Species detected in more than 10% of selected samples are retained for the
+Spearman correlation analysis. Correlation coefficients are used as labels in
+the LEfSe figure when the nominal correlation P value is below 0.05.
+
+```{r species-correlations}
+prevalent_species <- apply(
+  dat_rela_select,
+  1,
+  function(values) {
+    sum(values > 0) > ncol(dat_rela_select) * prevalence_fraction
+  }
+)
+correlation_matrix <- dat_rela_select[prevalent_species, , drop = FALSE]
+
+spearman_rho <- apply(
+  correlation_matrix,
+  1,
+  function(values) {
+    stats::cor(
+      values,
+      metadata_select$Good_B_cell_percent,
+      method = "spearman",
+      use = "pairwise.complete.obs"
+    )
+  }
+)
+spearman_p <- apply(
+  correlation_matrix,
+  1,
+  function(values) {
+    suppressWarnings(
+      stats::cor.test(
+        values,
+        metadata_select$Good_B_cell_percent,
+        method = "spearman"
+      )$p.value
+    )
+  }
+)
+
+correlation_results <- data.frame(
+  Names = rownames(correlation_matrix),
+  spearman_rho = as.numeric(spearman_rho),
+  spearman_p = as.numeric(spearman_p),
+  stringsAsFactors = FALSE
+) |>
+  dplyr::arrange(.data$spearman_p)
+
+significant_correlations <- correlation_results |>
+  dplyr::filter(.data$spearman_p < 0.05) |>
+  dplyr::arrange(.data$spearman_rho)
+
+data.frame(
+  prevalent_species = nrow(correlation_results),
+  nominally_significant_correlations = nrow(significant_correlations)
+)
+```
+
+# 3. LEfSe comparison of high and low B-cell groups
+
+```{r run-lefse}
+taxonomy_row_data <- dat_name[, setdiff(names(dat_name), "merger"), drop = FALSE]
+
+lefse_object <- SummarizedExperiment::SummarizedExperiment(
+  assays = list(counts = as.matrix(dat_rela_select)),
+  colData = as.data.frame(metadata_select),
+  rowData = taxonomy_row_data
+)
+
+set.seed(lefse_seed)
+lefse_result <- suppressWarnings(
+  lefser::lefser(
+    lefse_object,
+    groupCol = "B_cell_group"
+  )
+) |>
+  as.data.frame()
+
+lefse_result$class <- dat_name$class[
+  match(lefse_result$Names, dat_name$species)
+]
+lefse_result$correlation_label <- significant_correlations$spearman_rho[
+  match(lefse_result$Names, significant_correlations$Names)
+]
+
+lefse_output <- lefse_result |>
+  dplyr::select(.data$Names, .data$scores, .data$class)
+
+utils::write.csv(
+  lefse_output,
+  file.path(table_dir, "lefse_good_B_cell_groups.csv"),
+  row.names = FALSE,
+  na = ""
+)
+
+lefse_output
+```
+
+```{r plot-lefse, fig.width=10.11, fig.height=4.16}
+lefse_plot_data <- lefse_result |>
+  dplyr::mutate(
+    class = factor(
+      .data$class,
+      levels = c(
+        "c__Gammaproteobacteria",
+        "c__Bacilli",
+        "c__Clostridia"
+      )
+    )
+  )
+
+p_lefse <- ggpubr::ggdotchart(
+  lefse_plot_data,
+  x = "Names",
+  y = "scores",
+  color = "class",
+  sorting = "ascending",
+  group = "class",
+  sort.by.groups = TRUE,
+  add = "segments",
+  palette = c("#00AFBB", "#E7B800", "#FC4E07"),
+  label = round(lefse_plot_data$correlation_label, 2),
+  dot.size = 6
+) +
+  ggplot2::theme_bw(base_size = 12) +
+  ggplot2::theme(
+    legend.title = ggplot2::element_blank(),
+    axis.title.x = ggplot2::element_blank(),
+    plot.title = ggplot2::element_blank(),
+    axis.text = ggplot2::element_text(family = "ArialMT", angle = 90, hjust = 1),
+    axis.title = ggplot2::element_text(family = "ArialMT"),
+    panel.grid = ggplot2::element_blank(),
+    panel.border = ggplot2::element_rect(fill = NA, colour = "grey87")
+  ) +
+  ggplot2::scale_y_continuous(expand = c(0.2, 0.2)) +
+  ggplot2::labs(y = "LDA score")
+
+ggplot2::ggsave(
+  file.path(figure_dir, "lefse_good_B_cell_groups.pdf"),
+  p_lefse,
+  width = 10.11,
+  height = 4.16
+)
+
+p_lefse
+```
+
+# 4. Species-level abundance comparisons
+
+```{r boxplot-functions}
+group_colors <- c("less" = "#67a9cf", "more" = "#ef8a62")
+
+make_species_boxplot <- function(species_name) {
+  plot_data <- data.frame(
+    B_cell_group = metadata_select$B_cell_group,
+    abundance = as.numeric(dat_rela_select[species_name, ]),
+    stringsAsFactors = FALSE
+  )
+
+  ggplot2::ggplot(
+    plot_data,
+    ggplot2::aes(x = .data$B_cell_group, y = .data$abundance)
+  ) +
+    ggplot2::geom_boxplot(
+      ggplot2::aes(fill = .data$B_cell_group),
+      width = 0.4
+    ) +
+    ggpubr::stat_compare_means(
+      comparisons = list(c("less", "more")),
+      method = "wilcox.test"
+    ) +
+    ggplot2::theme_bw(base_size = 12) +
+    ggplot2::theme(
+      legend.position = "none",
+      aspect.ratio = 1,
+      legend.title = ggplot2::element_blank(),
+      axis.title.x = ggplot2::element_blank(),
+      plot.title = ggplot2::element_text(
+        hjust = 0.5,
+        face = "italic",
+        size = 9
+      ),
+      axis.text = ggplot2::element_text(family = "ArialMT"),
+      axis.title = ggplot2::element_text(family = "ArialMT"),
+      panel.grid = ggplot2::element_blank(),
+      panel.border = ggplot2::element_rect(fill = NA, colour = "grey87")
+    ) +
+    ggplot2::labs(
+      y = "Relative abundance",
+      title = sub("^s__", "", species_name)
+    ) +
+    ggplot2::scale_fill_manual(values = group_colors) +
+    ggplot2::scale_y_continuous(
+      expand = ggplot2::expansion(mult = c(0.05, 0.18))
+    )
+}
+
+p_blautia_wexlerae <- make_species_boxplot("s__Blautia_wexlerae")
+p_blautia_caecimuris <- make_species_boxplot("s__Blautia_caecimuris")
+p_ruminococcus_bromii <- make_species_boxplot("s__Ruminococcus_bromii")
+p_romboutsia_ilealis <- make_species_boxplot("s__Romboutsia_ilealis")
+```
+
+```{r plot-blautia-boxplots, fig.width=5.69, fig.height=2.66}
+p_blautia_boxplots <- ggpubr::ggarrange(
+  p_blautia_wexlerae,
+  p_blautia_caecimuris,
+  align = "hv",
+  ncol = 2
+)
+
+ggplot2::ggsave(
+  file.path(figure_dir, "good_B_cell_boxplots_blautia.pdf"),
+  p_blautia_boxplots,
+  width = 5.69,
+  height = 2.66
+)
+
+p_blautia_boxplots
+```
+
+```{r plot-ruminococcus-romboutsia-boxplots, fig.width=5.69, fig.height=2.66}
+p_ruminococcus_romboutsia_boxplots <- ggpubr::ggarrange(
+  p_ruminococcus_bromii,
+  p_romboutsia_ilealis,
+  align = "hv",
+  ncol = 2
+)
+
+ggplot2::ggsave(
+  file.path(figure_dir, "good_B_cell_boxplots_ruminococcus_romboutsia.pdf"),
+  p_ruminococcus_romboutsia_boxplots,
+  width = 5.69,
+  height = 2.66
+)
+
+p_ruminococcus_romboutsia_boxplots
+```
+
+# 5. Session information
+
+```{r session-information}
+sessionInfo()
+```

@@ -1,0 +1,842 @@
+---
+title: "Bray-Curtis PERMANOVA of longitudinal full-length 16S profiles"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+knit: (function(inputFile, encoding) { rmarkdown::render(inputFile, encoding = encoding, output_dir = tools::file_path_sans_ext(basename(inputFile))) })
+---
+
+This analysis quantifies temporal differences in species-level full-length 16S
+community composition using Bray-Curtis PERMANOVA. It reports baseline-versus-
+time-point contrasts, a global main model, clinical and antibiotic sensitivity
+models, and a summary of temporal-effect robustness across model specifications.
+
+```{r setup, message=FALSE, warning=FALSE}
+required_packages <- c(
+  "vegan", "dplyr", "tidyr", "tibble", "purrr", "ggplot2"
+)
+missing_packages <- required_packages[
+  !vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)
+]
+if (length(missing_packages) > 0L) {
+  stop(
+    "Install the following R packages before running this analysis: ",
+    paste(missing_packages, collapse = ", ")
+  )
+}
+
+suppressPackageStartupMessages({
+  library(vegan)
+  library(dplyr)
+  library(tidyr)
+  library(tibble)
+  library(purrr)
+  library(ggplot2)
+})
+
+input_file <- "000.input16S.Rds"
+analysis_name <- "03.16sPCoA.PERMANOVA"
+output_root <- analysis_name
+adonis_dir <- file.path(output_root, "adonis2")
+figure_dir <- file.path(output_root, "figures")
+
+dir.create(output_root, recursive = TRUE, showWarnings = FALSE)
+dir.create(adonis_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(figure_dir, recursive = TRUE, showWarnings = FALSE)
+
+knitr::opts_chunk$set(
+  fig.path = file.path(output_root, "knitr_figures", "")
+)
+
+# These analysis parameters are unchanged from the source Rmd.
+key_groups <- c("BL", "D0", "D14", "M1", "M2", "M3", "M6")
+baseline_group <- "BL"
+n_permutations <- 9999
+min_paired_cycles <- 3
+min_pairwise_samples <- 3
+min_factor_levels <- 2
+min_category_n <- 3
+
+set.seed(20260528)
+```
+
+# 1. Utility functions
+
+```{r functions}
+write_result_csv <- function(data, filename) {
+  utils::write.csv(
+    data,
+    file.path(adonis_dir, filename),
+    row.names = FALSE,
+    na = ""
+  )
+}
+
+factor_usable <- function(x, min_n = 1L) {
+  x <- droplevels(factor(x))
+  nlevels(x) >= min_factor_levels && all(table(x) >= min_n)
+}
+
+numeric_usable <- function(x) {
+  x <- as.numeric(x)
+  sum(!is.na(x)) >= 3L && stats::sd(x, na.rm = TRUE) > 0
+}
+
+is_variable_usable <- function(data, variable, min_n = 1L) {
+  if (!variable %in% names(data)) return(FALSE)
+  x <- data[[variable]]
+  if (is.numeric(x)) numeric_usable(x) else factor_usable(x, min_n)
+}
+
+is_model_matrix_full_rank <- function(data, terms) {
+  rhs <- paste(terms, collapse = " + ")
+  model_matrix <- tryCatch(
+    stats::model.matrix(
+      stats::as.formula(paste("~", rhs)),
+      data = data
+    ),
+    error = function(e) NULL
+  )
+  !is.null(model_matrix) && qr(model_matrix)$rank == ncol(model_matrix)
+}
+
+extract_adonis_table <- function(fit, model_name) {
+  as.data.frame(fit) |>
+    tibble::rownames_to_column("term") |>
+    tibble::as_tibble() |>
+    dplyr::rename(
+      Df = dplyr::any_of("Df"),
+      SumOfSqs = dplyr::any_of("SumOfSqs"),
+      R2 = dplyr::any_of("R2"),
+      F = dplyr::any_of("F"),
+      P = dplyr::any_of("Pr(>F)")
+    ) |>
+    dplyr::mutate(model = model_name) |>
+    dplyr::relocate(.data$model, .data$term)
+}
+
+run_adonis2_model <- function(
+    distance,
+    metadata,
+    terms,
+    model_name,
+    permutations = n_permutations,
+    strata = NULL) {
+
+  metadata <- as.data.frame(metadata)
+  rownames(metadata) <- metadata$sample_id
+
+  missing_terms <- setdiff(terms, names(metadata))
+  if (length(missing_terms) > 0L) {
+    return(tibble::tibble(
+      model = model_name,
+      term = NA_character_,
+      status = "skipped",
+      reason = paste("missing terms:", paste(missing_terms, collapse = ", "))
+    ))
+  }
+
+  keep <- stats::complete.cases(metadata[, terms, drop = FALSE])
+  metadata_use <- droplevels(metadata[keep, , drop = FALSE])
+  distance_matrix <- as.matrix(distance)
+  distance_use <- stats::as.dist(
+    distance_matrix[
+      rownames(metadata_use),
+      rownames(metadata_use),
+      drop = FALSE
+    ]
+  )
+
+  if (nrow(metadata_use) < min_pairwise_samples) {
+    return(tibble::tibble(
+      model = model_name,
+      term = NA_character_,
+      status = "skipped",
+      reason = paste("too few samples:", nrow(metadata_use))
+    ))
+  }
+  if (!is_model_matrix_full_rank(metadata_use, terms)) {
+    return(tibble::tibble(
+      model = model_name,
+      term = NA_character_,
+      status = "skipped",
+      reason = "model matrix is rank deficient / collinear"
+    ))
+  }
+
+  distance_for_model <- distance_use
+  model_formula <- stats::as.formula(
+    paste("distance_for_model ~", paste(terms, collapse = " + "))
+  )
+  environment(model_formula) <- environment()
+
+  fit <- tryCatch(
+    {
+      if (is.null(strata)) {
+        vegan::adonis2(
+          model_formula,
+          data = metadata_use,
+          permutations = permutations,
+          by = "margin"
+        )
+      } else {
+        vegan::adonis2(
+          model_formula,
+          data = metadata_use,
+          permutations = permutations,
+          by = "margin",
+          strata = strata[keep]
+        )
+      }
+    },
+    error = function(e) e
+  )
+
+  if (inherits(fit, "error")) {
+    return(tibble::tibble(
+      model = model_name,
+      term = NA_character_,
+      status = "failed",
+      reason = fit$message
+    ))
+  }
+
+  extract_adonis_table(fit, model_name) |>
+    dplyr::mutate(
+      status = "ok",
+      reason = NA_character_,
+      n_samples = nrow(metadata_use)
+    )
+}
+
+group_effect_row <- function(result_table, model_name) {
+  result_table |>
+    dplyr::filter(
+      .data$model == model_name,
+      .data$term == "group_label",
+      .data$status == "ok"
+    ) |>
+    dplyr::slice(1L)
+}
+
+format_p_label <- function(p) {
+  ifelse(
+    is.na(p),
+    "P = NA",
+    ifelse(p < 0.001, "P < 0.001", paste0("P = ", sprintf("%.4f", p)))
+  )
+}
+```
+
+# 2. Prepare de-identified metadata and Bray-Curtis distances
+
+Only fields used by the requested models are retained. The released
+`Sample_Name` replaces the original sample identifier.
+
+```{r prepare-data}
+if (!file.exists(input_file)) {
+  stop("Input file not found: ", input_file)
+}
+
+input16S <- readRDS(input_file)
+if (!is.list(input16S) || !all(c("dat_rela", "metainfo") %in% names(input16S))) {
+  stop("000.input16S.Rds must contain dat_rela and metainfo.")
+}
+
+dat_rela <- input16S$dat_rela
+metainfo <- input16S$metainfo
+
+required_metadata <- c(
+  "Sample_Name", "Patient_ID", "pId_new", "timeIDcontiue", "batch",
+  "Age", "Sex", "Disease", "project_id", "abx_recent", "abx_days_14",
+  "broad_abx_14d"
+)
+missing_metadata <- setdiff(required_metadata, names(metainfo))
+if (length(missing_metadata) > 0L) {
+  stop("metainfo is missing required column(s): ", paste(missing_metadata, collapse = ", "))
+}
+if (!identical(colnames(dat_rela), as.character(metainfo$Sample_Name))) {
+  stop("dat_rela columns are not aligned with metainfo$Sample_Name.")
+}
+
+group_label_all <- sub("^[0-9]+_", "", metainfo$timeIDcontiue)
+
+meta_6tp <- metainfo |>
+  dplyr::transmute(
+    sample_id = as.character(.data$Sample_Name),
+    pId = factor(.data$Patient_ID),
+    pId_new = factor(.data$pId_new),
+    group_label = factor(group_label_all, levels = key_groups),
+    batch = factor(.data$batch),
+    Age_years = as.numeric(.data$Age),
+    Sex = factor(.data$Sex),
+    Disease = factor(.data$Disease),
+    project_id = factor(.data$project_id),
+    abx_recent = factor(.data$abx_recent),
+    abx_days_14 = as.numeric(.data$abx_days_14),
+    broad_abx_14d = factor(.data$broad_abx_14d)
+  ) |>
+  dplyr::filter(!is.na(.data$group_label)) |>
+  droplevels()
+
+meta_6tp$Age_scaled <- as.numeric(scale(meta_6tp$Age_years))
+
+if (anyNA(meta_6tp$abx_days_14)) {
+  stop("abx_days_14 must be numeric and non-missing.")
+}
+
+abundance_taxa_by_sample <- as.matrix(
+  dat_rela[, meta_6tp$sample_id, drop = FALSE]
+)
+storage.mode(abundance_taxa_by_sample) <- "numeric"
+abundance_taxa_by_sample[is.na(abundance_taxa_by_sample)] <- 0
+
+# Convert taxa x samples to samples x taxa and remove empty taxa/samples.
+abundance_matrix <- t(abundance_taxa_by_sample)
+abundance_matrix <- abundance_matrix[
+  rowSums(abundance_matrix) > 0,
+  colSums(abundance_matrix) > 0,
+  drop = FALSE
+]
+
+# Preserve the source script's automatic relative-abundance check.
+sample_sums <- rowSums(abundance_matrix)
+already_relative <- all(sample_sums > 0) &&
+  stats::median(abs(sample_sums - 1), na.rm = TRUE) < 1e-3
+if (!already_relative) {
+  abundance_matrix <- sweep(abundance_matrix, 1, rowSums(abundance_matrix), "/")
+  abundance_matrix[is.na(abundance_matrix)] <- 0
+}
+
+meta_6tp <- meta_6tp |>
+  dplyr::filter(.data$sample_id %in% rownames(abundance_matrix)) |>
+  dplyr::arrange(match(.data$sample_id, rownames(abundance_matrix))) |>
+  droplevels()
+abundance_matrix <- abundance_matrix[meta_6tp$sample_id, , drop = FALSE]
+
+stopifnot(identical(meta_6tp$sample_id, rownames(abundance_matrix)))
+
+bray_distance <- vegan::vegdist(abundance_matrix, method = "bray")
+bray_matrix <- as.matrix(bray_distance)
+
+data.frame(
+  time_group = key_groups,
+  n_samples = as.integer(table(meta_6tp$group_label))
+)
+```
+
+# 3. Global main PERMANOVA
+
+```{r global-main, message=FALSE, warning=FALSE}
+global_main <- run_adonis2_model(
+  distance = bray_distance,
+  metadata = meta_6tp,
+  terms = c("batch", "Age_scaled", "group_label"),
+  model_name = "Global_main_batch_age_group"
+)
+
+write_result_csv(global_main, "global_PERMANOVA_main.csv")
+global_main
+```
+
+# 4. Antibiotic sensitivity models
+
+Each antibiotic variable is entered in a separate model, as in the source
+analysis, to avoid combining correlated exposure variables.
+
+```{r antibiotic-sensitivity, message=FALSE, warning=FALSE}
+antibiotic_models <- list(
+  Model_abx_recent = c("batch", "Age_scaled", "abx_recent", "group_label"),
+  Model_abx_days_14 = c("batch", "Age_scaled", "abx_days_14", "group_label"),
+  Model_broad_abx_14d = c("batch", "Age_scaled", "broad_abx_14d", "group_label")
+)
+
+antibiotic_results <- purrr::imap_dfr(
+  antibiotic_models,
+  ~ run_adonis2_model(
+    bray_distance,
+    meta_6tp,
+    terms = .x,
+    model_name = .y
+  )
+)
+
+write_result_csv(
+  antibiotic_results,
+  "antibiotic_sensitivity_PERMANOVA_all.csv"
+)
+
+antibiotic_results |>
+  dplyr::filter(.data$term == "group_label")
+```
+
+# 5. Clinical sensitivity models
+
+```{r clinical-sensitivity, message=FALSE, warning=FALSE}
+if (!is_variable_usable(meta_6tp, "Sex", min_n = min_category_n)) {
+  stop("Sex has fewer than two usable levels or a category is too small.")
+}
+if (!is_variable_usable(meta_6tp, "Disease", min_n = min_category_n)) {
+  stop("Disease has fewer than two usable levels or a category is too small.")
+}
+
+clinical_results <- dplyr::bind_rows(
+  run_adonis2_model(
+    bray_distance,
+    meta_6tp,
+    terms = c("batch", "Age_scaled", "Sex", "group_label"),
+    model_name = "Clinical_model_1_batch_age_sex_group"
+  ),
+  run_adonis2_model(
+    bray_distance,
+    meta_6tp,
+    terms = c("batch", "Age_scaled", "Sex", "Disease", "group_label"),
+    model_name = "Clinical_model_2_batch_age_sex_disease_group"
+  )
+)
+
+write_result_csv(
+  clinical_results,
+  "clinical_sensitivity_PERMANOVA_all.csv"
+)
+
+clinical_results |>
+  dplyr::filter(.data$term == "group_label")
+```
+
+```{r preserve-original-permutation-stream, include=FALSE}
+# The source Rmd ran this project-adjusted model between the clinical and
+# pairwise sections. Its result is not part of the requested release, but the
+# call is retained invisibly so the downstream pairwise permutation stream
+# follows the same seeded execution order.
+invisible(
+  run_adonis2_model(
+    bray_distance,
+    meta_6tp,
+    terms = c("batch", "Age_scaled", "project_id", "group_label"),
+    model_name = "Project_rng_alignment"
+  )
+)
+```
+
+# 6. Pairwise PERMANOVA: baseline versus each timepoint
+
+When at least three treatment cycles contain both baseline and the target
+timepoint, only those paired cycles are used and permutations are restricted by
+`pId_new`.
+
+```{r pairwise-permanova, message=FALSE, warning=FALSE}
+run_pairwise_main <- function(target_group) {
+  metadata_pair_all <- meta_6tp |>
+    dplyr::filter(.data$group_label %in% c(baseline_group, target_group)) |>
+    droplevels()
+
+  cycles_with_both <- metadata_pair_all |>
+    dplyr::count(.data$pId_new, .data$group_label) |>
+    dplyr::count(.data$pId_new) |>
+    dplyr::filter(.data$n == 2L) |>
+    dplyr::pull(.data$pId_new)
+
+  paired_only_used <- length(cycles_with_both) >= min_paired_cycles
+  metadata_pair <- if (paired_only_used) {
+    metadata_pair_all |>
+      dplyr::filter(.data$pId_new %in% cycles_with_both) |>
+      droplevels()
+  } else {
+    metadata_pair_all
+  }
+
+  comparison <- paste(target_group, "vs", baseline_group)
+  if (
+    nrow(metadata_pair) < min_pairwise_samples ||
+      nlevels(metadata_pair$group_label) < 2L
+  ) {
+    return(tibble::tibble(
+      comparison = comparison,
+      n_samples = nrow(metadata_pair),
+      n_cycles = dplyr::n_distinct(metadata_pair$pId_new),
+      paired_only_used = paired_only_used,
+      strata_used = FALSE,
+      R2 = NA_real_,
+      F = NA_real_,
+      P = NA_real_,
+      status = "skipped",
+      reason = "too few samples or only one group"
+    ))
+  }
+
+  sample_ids <- metadata_pair$sample_id
+  distance_pair <- stats::as.dist(
+    bray_matrix[sample_ids, sample_ids, drop = FALSE]
+  )
+  metadata_pair <- as.data.frame(metadata_pair)
+  rownames(metadata_pair) <- metadata_pair$sample_id
+
+  run_pairwise_fit <- function(use_strata) {
+    distance_for_model <- distance_pair
+    model_formula <- distance_for_model ~ group_label
+
+    tryCatch(
+      {
+        if (use_strata) {
+          vegan::adonis2(
+            model_formula,
+            data = metadata_pair,
+            permutations = n_permutations,
+            by = "margin",
+            strata = metadata_pair$pId_new
+          )
+        } else {
+          vegan::adonis2(
+            model_formula,
+            data = metadata_pair,
+            permutations = n_permutations,
+            by = "margin"
+          )
+        }
+      },
+      error = function(e) e
+    )
+  }
+
+  fit <- run_pairwise_fit(paired_only_used)
+  strata_used <- paired_only_used && !inherits(fit, "error")
+  if (inherits(fit, "error") && paired_only_used) {
+    fit <- run_pairwise_fit(FALSE)
+    strata_used <- FALSE
+  }
+
+  if (inherits(fit, "error")) {
+    return(tibble::tibble(
+      comparison = comparison,
+      n_samples = nrow(metadata_pair),
+      n_cycles = dplyr::n_distinct(metadata_pair$pId_new),
+      paired_only_used = paired_only_used,
+      strata_used = strata_used,
+      R2 = NA_real_,
+      F = NA_real_,
+      P = NA_real_,
+      status = "failed",
+      reason = fit$message
+    ))
+  }
+
+  group_row <- extract_adonis_table(fit, "pairwise_main") |>
+    dplyr::filter(.data$term == "group_label") |>
+    dplyr::slice(1L)
+
+  tibble::tibble(
+    comparison = comparison,
+    n_samples = nrow(metadata_pair),
+    n_cycles = dplyr::n_distinct(metadata_pair$pId_new),
+    paired_only_used = paired_only_used,
+    strata_used = strata_used,
+    R2 = group_row$R2,
+    F = group_row$F,
+    P = group_row$P,
+    status = "ok",
+    reason = NA_character_
+  )
+}
+
+pairwise_results <- purrr::map_dfr(
+  setdiff(key_groups, baseline_group),
+  run_pairwise_main
+) |>
+  dplyr::mutate(FDR = stats::p.adjust(.data$P, method = "fdr"))
+
+write_result_csv(
+  pairwise_results,
+  "pairwise_PERMANOVA_BL_vs_each_timepoint.csv"
+)
+
+pairwise_results
+```
+
+# 7. Verification subset requested for the final report
+
+This verification excludes samples with high-impact broad-spectrum antibiotic
+exposure, restricts the longitudinal window to BL through M2, and adjusts for
+batch, age, disease category, sex, and recent antibiotic exposure.
+
+```{r verification-subset, message=FALSE, warning=FALSE}
+verification_groups <- c("BL", "D0", "D14", "M1", "M2")
+
+verification_meta <- meta_6tp |>
+  dplyr::filter(
+    as.character(.data$broad_abx_14d) == "No",
+    as.character(.data$group_label) %in% verification_groups
+  ) |>
+  dplyr::mutate(
+    group_label = factor(as.character(.data$group_label), levels = verification_groups)
+  ) |>
+  droplevels()
+
+verification_ids <- verification_meta$sample_id
+verification_distance <- stats::as.dist(
+  bray_matrix[verification_ids, verification_ids, drop = FALSE]
+)
+
+verification_model_name <- paste0(
+  "Verification_exclude_broad_abx_BL_to_M2_",
+  "batch_age_disease_sex_recent_abx_group"
+)
+
+verification_result <- run_adonis2_model(
+  verification_distance,
+  verification_meta,
+  terms = c(
+    "batch", "Age_scaled", "Disease", "Sex", "abx_recent", "group_label"
+  ),
+  model_name = verification_model_name
+)
+
+write_result_csv(
+  verification_result,
+  "verification_subset_PERMANOVA.csv"
+)
+
+verification_group_effect <- group_effect_row(
+  verification_result,
+  verification_model_name
+)
+if (nrow(verification_group_effect) != 1L) {
+  stop("The verification model did not return a valid group_label effect.")
+}
+
+verification_summary <- tibble::tibble(
+  analysis = "Exclude broad-spectrum antibiotic exposure; BL-M2 subset",
+  adjusted_for = "batch, age, disease category, sex, recent antibiotic exposure",
+  n_samples = verification_group_effect$n_samples,
+  R2 = verification_group_effect$R2,
+  R2_percent = 100 * verification_group_effect$R2,
+  P = verification_group_effect$P
+)
+
+write_result_csv(
+  verification_summary,
+  "verification_subset_time_group_effect.csv"
+)
+
+cat(
+  sprintf(
+    "Time-group effect: R2 = %.2f%%, %s",
+    verification_summary$R2_percent,
+    format_p_label(verification_summary$P)
+  )
+)
+```
+
+# 8. Forest plot of adjusted time-group effects
+
+The plot uses the `group_label` row from each fitted model. R2 is displayed as
+percent explained variance, and the dashed vertical reference is the observed
+main-model R2 rather than a manually entered approximation.
+
+```{r forest-data}
+main_effect <- group_effect_row(
+  global_main,
+  "Global_main_batch_age_group"
+)
+clinical_sex_effect <- group_effect_row(
+  clinical_results,
+  "Clinical_model_1_batch_age_sex_group"
+)
+clinical_disease_effect <- group_effect_row(
+  clinical_results,
+  "Clinical_model_2_batch_age_sex_disease_group"
+)
+recent_abx_effect <- group_effect_row(
+  antibiotic_results,
+  "Model_abx_recent"
+)
+days_abx_effect <- group_effect_row(
+  antibiotic_results,
+  "Model_abx_days_14"
+)
+broad_abx_effect <- group_effect_row(
+  antibiotic_results,
+  "Model_broad_abx_14d"
+)
+
+model_data <- tibble::tibble(
+  Model_Type = c(
+    "Main Model",
+    "Clinical Sensitivity", "Clinical Sensitivity",
+    "Antibiotic Sensitivity", "Antibiotic Sensitivity", "Antibiotic Sensitivity",
+    "Verification Model"
+  ),
+  Model_Name = c(
+    "Main (Batch + Age + Group)",
+    "Main + Sex",
+    "Main + Sex + Disease",
+    "Main + Recent Abx",
+    "Main + 14d Abx",
+    "Main + 14d Broad Abx (High-impact)",
+    "Exclude Broad Abx; BL-M2; Full Adjustment"
+  ),
+  R2 = 100 * c(
+    main_effect$R2,
+    clinical_sex_effect$R2,
+    clinical_disease_effect$R2,
+    recent_abx_effect$R2,
+    days_abx_effect$R2,
+    broad_abx_effect$R2,
+    verification_group_effect$R2
+  ),
+  P_value = c(
+    main_effect$P,
+    clinical_sex_effect$P,
+    clinical_disease_effect$P,
+    recent_abx_effect$P,
+    days_abx_effect$P,
+    broad_abx_effect$P,
+    verification_group_effect$P
+  )
+)
+
+model_data$Model_Name <- factor(
+  model_data$Model_Name,
+  levels = rev(model_data$Model_Name)
+)
+model_data$Model_Type <- factor(
+  model_data$Model_Type,
+  levels = c(
+    "Main Model", "Clinical Sensitivity", "Antibiotic Sensitivity",
+    "Verification Model"
+  )
+)
+model_data <- model_data |>
+  dplyr::mutate(
+    Significance = ifelse(
+      .data$P_value < 0.05,
+      "Significant",
+      "Not Significant"
+    ),
+    Label = format_p_label(.data$P_value)
+  )
+
+write_result_csv(
+  model_data |>
+    dplyr::mutate(
+      Model_Name = as.character(.data$Model_Name),
+      Model_Type = as.character(.data$Model_Type)
+    ),
+  "permanova_temporal_effect_robustness.csv"
+)
+
+model_data
+```
+
+```{r forest-plot, fig.width=7, fig.height=4.1, message=FALSE, warning=FALSE}
+main_r2_percent <- main_effect$R2 * 100
+x_axis_max <- max(6, ceiling(max(model_data$R2, na.rm = TRUE) + 1))
+
+p_forest <- ggplot2::ggplot(
+  model_data,
+  ggplot2::aes(x = .data$R2, y = .data$Model_Name)
+) +
+  ggplot2::geom_vline(
+    xintercept = main_r2_percent,
+    linetype = "dashed",
+    color = "grey70"
+  ) +
+  ggplot2::geom_point(
+    ggplot2::aes(
+      color = .data$Model_Type,
+      shape = .data$Significance
+    ),
+    size = 5
+  ) +
+  ggplot2::geom_segment(
+    ggplot2::aes(
+      x = 0,
+      xend = .data$R2,
+      y = .data$Model_Name,
+      yend = .data$Model_Name,
+      color = .data$Model_Type
+    ),
+    linetype = "dotted",
+    linewidth = 0.8
+  ) +
+  ggplot2::geom_text(
+    ggplot2::aes(label = .data$Label),
+    hjust = -0.3,
+    size = 4,
+    family = "ArialMT"
+  ) +
+  ggplot2::scale_x_continuous(
+    limits = c(0, x_axis_max),
+    breaks = seq(0, x_axis_max, 1)
+  ) +
+  ggplot2::scale_color_manual(
+    values = c(
+      "Main Model" = "#1F77B4",
+      "Clinical Sensitivity" = "#2CA02C",
+      "Antibiotic Sensitivity" = "#D62728",
+      "Verification Model" = "#9467BD"
+    )
+  ) +
+  ggplot2::scale_shape_manual(
+    values = c(
+      "Significant" = 16,
+      "Not Significant" = 1
+    )
+  ) +
+  ggplot2::guides(
+    color = ggplot2::guide_legend(
+      order = 1,
+      nrow = 2,
+      byrow = TRUE,
+      override.aes = list(shape = 16, size = 4)
+    ),
+    shape = ggplot2::guide_legend(
+      order = 2,
+      nrow = 1,
+      byrow = TRUE,
+      override.aes = list(color = "black", size = 4)
+    )
+  ) +
+  ggplot2::labs(
+    x = "Explained Variance (R2 %)",
+    y = NULL,
+    title = "Robustness of Temporal Effect (PERMANOVA)"
+  ) +
+  ggplot2::theme_classic(base_size = 12) +
+  ggplot2::theme(
+    legend.position = "bottom",
+    legend.box = "vertical",
+    legend.box.just = "center",
+    legend.title = ggplot2::element_blank(),
+    legend.text = ggplot2::element_text(size = 9),
+    legend.key.width = grid::unit(0.8, "lines"),
+    legend.spacing.y = grid::unit(0, "pt"),
+    axis.title.y = ggplot2::element_blank(),
+    plot.title = ggplot2::element_text(hjust = 0.5),
+    panel.grid = ggplot2::element_blank(),
+    panel.border = ggplot2::element_rect(fill = NA, colour = "grey87")
+  )
+
+forest_pdf <- file.path(
+  figure_dir,
+  "permanova_temporal_effect_robustness.pdf"
+)
+
+ggplot2::ggsave(
+  filename = forest_pdf,
+  plot = p_forest,
+  width = 7.00,
+  height = 4.10,
+  device = "pdf"
+)
+
+p_forest
+```
+
+# 9. Reproducibility record
+
+```{r session-info}
+sessionInfo()
+```
