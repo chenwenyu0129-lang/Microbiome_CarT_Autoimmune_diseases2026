@@ -1,0 +1,438 @@
+---
+title: "Alpha-diversity longitudinal pairwise-comparison heatmap"
+output:
+  html_document:
+    toc: true
+    number_sections: true
+knit: (function(inputFile, encoding) { rmarkdown::render(inputFile, encoding = encoding, output_dir = tools::file_path_sans_ext(basename(inputFile))) })
+---
+
+This analysis evaluates longitudinal changes in three species-level
+alpha-diversity indices using six covariate-adjusted mixed-effects model
+specifications. Pairwise time-point contrasts are summarized in a 6-model by
+3-index heatmap of raw P-value significance.
+
+```{r setup, message=FALSE, warning=FALSE}
+required_packages <- c(
+  "dplyr", "tidyr", "tibble", "ggplot2", "lme4", "lmerTest", "emmeans"
+)
+
+missing_packages <- required_packages[
+  !vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)
+]
+if (length(missing_packages) > 0L) {
+  stop(
+    "Install the following R packages before running this analysis: ",
+    paste(missing_packages, collapse = ", ")
+  )
+}
+
+set.seed(20260523)
+
+input_file <- "000.input16S.Rds"
+analysis_name <- "01.alpha_diversity_pairwise_heatmap"
+output_root <- analysis_name
+table_dir <- file.path(output_root, "tables")
+model_dir <- file.path(output_root, "model_results")
+figure_dir <- file.path(output_root, "figures")
+
+dir.create(output_root, recursive = TRUE, showWarnings = FALSE)
+dir.create(table_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(model_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(figure_dir, recursive = TRUE, showWarnings = FALSE)
+
+# When the Rmd is knitted, any automatically generated supporting figures are
+# also kept under the script-named output directory.
+knitr::opts_chunk$set(
+  fig.path = file.path(output_root, "knitr_figures", "")
+)
+
+group_order <- c(
+  "001_BL", "002_D0", "003_D14", "004_M1", "005_M2",
+  "006_M3", "007_M4", "008_M5", "009_M6"
+)
+
+model_order <- c(
+  "main", "abx_recent", "abx_days_14", "broad_abx_14d",
+  "clinical_age_sex", "clinical_age_sex_disease"
+)
+
+diversity_order <- c("Shannon", "Simpson", "Observed")
+```
+
+# 1. Prepare the analysis table
+
+The released metadata fields correspond to the original analysis variables as
+follows:
+
+- `Sample_Name` -> `sample_id`
+- `Patient_ID` -> `pId`
+- `pId_new` -> repeated-measures cycle identifier
+- `timeIDcontiue` and `Timepoint` -> longitudinal analysis group
+- `Age` -> `Age_years`
+- `originSpecies_Shannon` -> `Shannon`
+- `originSpecies_Simpson` -> `Simpson_raw`; the modeled index is `1 - Simpson_raw`
+- `originSpecies_Sobs` -> `Observed`
+
+The original analysis grouped the single D3 sample with D0 and the single D7
+sample with D14. These two rules are retained explicitly below.
+
+```{r prepare-data}
+if (!file.exists(input_file)) {
+  stop("Input file not found: ", input_file)
+}
+
+input16S <- readRDS(input_file)
+if (!is.list(input16S) || !all(c("dat_rela", "metainfo") %in% names(input16S))) {
+  stop("000.input16S.Rds must contain dat_rela and metainfo.")
+}
+
+dat_rela <- input16S$dat_rela
+metainfo <- input16S$metainfo
+
+required_metadata <- c(
+  "Timepoint", "Patient_ID", "CART_Cycle_ID", "Sample_Name", "pId_new",
+  "Sex", "Age", "Disease", "timeIDcontiue", "project_id", "batch",
+  "abx_recent", "abx_days_14", "broad_abx_14d",
+  "originSpecies_Shannon", "originSpecies_Simpson", "originSpecies_Sobs"
+)
+missing_metadata <- setdiff(required_metadata, names(metainfo))
+if (length(missing_metadata) > 0L) {
+  stop("metainfo is missing required column(s): ", paste(missing_metadata, collapse = ", "))
+}
+
+if (!identical(colnames(dat_rela), as.character(metainfo$Sample_Name))) {
+  stop("The abundance matrix columns are not aligned with metainfo$Sample_Name.")
+}
+if (anyDuplicated(metainfo$Sample_Name) || anyDuplicated(colnames(dat_rela))) {
+  stop("Sample_Name must be unique in both dat_rela and metainfo.")
+}
+
+# Preserve the time grouping used to create the reference figure.
+analysis_group <- as.character(metainfo$timeIDcontiue)
+table(metainfo$Timepoint)
+analysis_group[metainfo$Timepoint == "D3"] <- "002_D0"
+analysis_group[metainfo$Timepoint == "D7"] <- "003_D14"
+
+analysis_dat <- metainfo |>
+  dplyr::transmute(
+    sample_id = as.character(.data$Sample_Name),
+    pId = as.character(.data$Patient_ID),
+    pId_new = as.character(.data$pId_new),
+    CART_Cycle_ID = as.character(.data$CART_Cycle_ID),
+    Timepoint = as.character(.data$Timepoint),
+    group_11 = factor(analysis_group, levels = group_order),
+    batch = factor(.data$batch),
+    Age_years = as.numeric(.data$Age),
+    Sex = factor(.data$Sex),
+    Disease = factor(.data$Disease),
+    project_id = factor(.data$project_id),
+    abx_recent = factor(.data$abx_recent, levels = c("No", "Yes")),
+    abx_days_14 = as.numeric(.data$abx_days_14),
+    broad_abx_14d = factor(.data$broad_abx_14d, levels = c("No", "Yes")),
+    Shannon = as.numeric(.data$originSpecies_Shannon),
+    Simpson_raw = as.numeric(.data$originSpecies_Simpson),
+    Simpson = 1 - .data$Simpson_raw,
+    Observed = as.numeric(.data$originSpecies_Sobs)
+  ) |>
+  dplyr::filter(!is.na(.data$group_11), !is.na(.data$batch)) |>
+  droplevels()
+
+if (anyNA(analysis_dat$abx_days_14)) {
+  stop("abx_days_14 must be numeric and non-missing for all released samples.")
+}
+
+stopifnot(
+  nrow(analysis_dat) == ncol(dat_rela),
+  identical(analysis_dat$sample_id, colnames(dat_rela)),
+  all(diversity_order %in% names(analysis_dat))
+)
+
+utils::write.csv(
+  analysis_dat,
+  file.path(table_dir, "01.alpha_diversity_analysis_data.csv"),
+  row.names = FALSE,
+  na = ""
+)
+
+sample_size_by_group <- analysis_dat |>
+  dplyr::count(.data$group_11, name = "n_samples", .drop = FALSE)
+
+utils::write.csv(
+  sample_size_by_group,
+  file.path(table_dir, "01.sample_size_by_group.csv"),
+  row.names = FALSE
+)
+
+
+```
+
+# 2. Fit mixed models and calculate raw pairwise P values
+
+Each index is analyzed using a linear mixed model with a random intercept for
+`pId_new`. All models include longitudinal group and sequencing batch. The six
+rows of the final heatmap correspond to the base model and five prespecified
+sensitivity models.
+
+```{r model-functions}
+is_covariate_usable <- function(dat, variable) {
+  if (!variable %in% names(dat)) return(FALSE)
+  x <- dat[[variable]]
+
+  if (is.factor(x) || is.character(x)) {
+    return(nlevels(droplevels(factor(x))) >= 2L)
+  }
+  if (is.numeric(x)) {
+    return(sum(!is.na(x)) >= 3L && stats::sd(x, na.rm = TRUE) > 0)
+  }
+  FALSE
+}
+
+fit_one_model <- function(dat, response, model_name, extra_covariates = character()) {
+  selected_columns <- unique(c(
+    "sample_id", "pId", "pId_new", "group_11", "batch",
+    response, extra_covariates
+  ))
+
+  model_dat <- dat[, selected_columns, drop = FALSE]
+  model_dat <- model_dat[
+    !is.na(model_dat[[response]]) &
+      !is.na(model_dat$group_11) &
+      !is.na(model_dat$pId_new),
+    , drop = FALSE
+  ]
+  model_dat <- droplevels(model_dat)
+
+  fixed_terms <- "group_11"
+  if (is_covariate_usable(model_dat, "batch")) {
+    fixed_terms <- c(fixed_terms, "batch")
+  }
+
+  usable_extra <- extra_covariates[
+    vapply(extra_covariates, function(x) is_covariate_usable(model_dat, x), logical(1))
+  ]
+  fixed_terms <- c(fixed_terms, usable_extra)
+
+  complete_columns <- unique(c(response, "pId_new", fixed_terms))
+  model_dat <- model_dat[stats::complete.cases(model_dat[, complete_columns, drop = FALSE]), , drop = FALSE]
+  model_dat <- droplevels(model_dat)
+
+  if (nrow(model_dat) < 6L || nlevels(model_dat$group_11) < 2L) {
+    stop(response, " / ", model_name, ": insufficient complete observations.")
+  }
+
+  model_formula <- stats::as.formula(
+    paste(response, "~", paste(fixed_terms, collapse = " + "), "+ (1 | pId_new)")
+  )
+
+  fit <- lmerTest::lmer(model_formula, data = model_dat, REML = FALSE)
+  emm <- emmeans::emmeans(fit, ~ group_11)
+  pairwise_raw <- as.data.frame(
+    emmeans::contrast(emm, method = "pairwise", adjust = "none")
+  )
+
+  pairwise_raw |>
+    dplyr::transmute(
+      diversity = response,
+      model = model_name,
+      formula = paste(deparse(model_formula), collapse = " "),
+      n_samples = nrow(model_dat),
+      n_cycles = dplyr::n_distinct(model_dat$pId_new),
+      singular_fit = lme4::isSingular(fit),
+      contrast = as.character(.data$contrast),
+      estimate = as.numeric(.data$estimate),
+      SE = as.numeric(.data$SE),
+      df = as.numeric(.data$df),
+      t.ratio = as.numeric(.data$t.ratio),
+      p.value.raw = as.numeric(.data$p.value)
+    )
+}
+```
+
+```{r run-models, message=FALSE, warning=FALSE}
+model_covariates <- list(
+  main = character(),
+  abx_recent = "abx_recent",
+  abx_days_14 = "abx_days_14",
+  broad_abx_14d = "broad_abx_14d",
+  clinical_age_sex = c("Age_years", "Sex"),
+  clinical_age_sex_disease = c("Age_years", "Sex", "Disease")
+)
+
+pairwise_results <- list()
+result_index <- 1L
+
+for (diversity_name in diversity_order) {
+  for (model_name in model_order) {
+    pairwise_results[[result_index]] <- fit_one_model(
+      dat = analysis_dat,
+      response = diversity_name,
+      model_name = model_name,
+      extra_covariates = model_covariates[[model_name]]
+    )
+    result_index <- result_index + 1L
+  }
+}
+
+pairwise_dat <- dplyr::bind_rows(pairwise_results)
+
+utils::write.csv(
+  pairwise_dat,
+  file.path(model_dir, "01.emmeans_pairwise_group_raw_pvalues.csv"),
+  row.names = FALSE,
+  na = ""
+)
+
+model_summary <- pairwise_dat |>
+  dplyr::distinct(
+    .data$diversity, .data$model, .data$formula,
+    .data$n_samples, .data$n_cycles, .data$singular_fit
+  )
+
+utils::write.csv(
+  model_summary,
+  file.path(model_dir, "01.alpha_model_summary.csv"),
+  row.names = FALSE,
+  na = ""
+)
+
+model_summary
+```
+
+# 3. Draw the symmetric raw-P-value star heatmap
+
+Pairwise comparisons are undirected, so each result is mirrored across the
+diagonal. Fill color represents `-log10(raw P)`. Asterisks use the nominal raw
+P-value thresholds in the reference figure.
+
+```{r prepare-heatmap-data}
+strip_group_prefix <- function(x) sub("^\\d+_", "", x)
+
+format_p_star <- function(p) {
+  ifelse(
+    is.na(p), "",
+    ifelse(p < 0.001, "***", ifelse(p < 0.01, "**", ifelse(p < 0.05, "*", "")))
+  )
+}
+
+plot_dat_one_direction <- pairwise_dat |>
+  tidyr::separate(
+    .data$contrast,
+    into = c("group_a", "group_b"),
+    sep = " - ",
+    remove = FALSE
+  ) |>
+  dplyr::transmute(
+    diversity = .data$diversity,
+    model = .data$model,
+    group_a = .data$group_a,
+    group_b = .data$group_b,
+    p_raw = as.numeric(.data$p.value.raw)
+  )
+
+plot_dat_symmetric <- dplyr::bind_rows(
+  plot_dat_one_direction |>
+    dplyr::transmute(
+      diversity, model,
+      x_group = .data$group_a,
+      y_group = .data$group_b,
+      p_raw
+    ),
+  plot_dat_one_direction |>
+    dplyr::transmute(
+      diversity, model,
+      x_group = .data$group_b,
+      y_group = .data$group_a,
+      p_raw
+    )
+)
+
+diag_dat <- tidyr::expand_grid(
+  diversity = diversity_order,
+  model = model_order,
+  x_group = group_order,
+  y_group = group_order
+) |>
+  dplyr::filter(.data$x_group == .data$y_group) |>
+  dplyr::mutate(p_raw = NA_real_)
+
+heatmap_dat <- dplyr::bind_rows(plot_dat_symmetric, diag_dat) |>
+  dplyr::mutate(
+    model = factor(.data$model, levels = model_order),
+    diversity = factor(.data$diversity, levels = diversity_order),
+    x_group = factor(.data$x_group, levels = group_order),
+    y_group = factor(.data$y_group, levels = rev(group_order)),
+    p_star = format_p_star(.data$p_raw),
+    neg_log10_p = ifelse(
+      is.na(.data$p_raw), NA_real_, -log10(pmax(.data$p_raw, 1e-300))
+    )
+  )
+```
+
+```{r draw-and-save-heatmap, fig.width=15.5, fig.height=22, message=FALSE, warning=FALSE}
+p_heatmap_star <- ggplot2::ggplot(
+  heatmap_dat,
+  ggplot2::aes(x = .data$x_group, y = .data$y_group, fill = .data$neg_log10_p)
+) +
+  ggplot2::geom_tile(color = "white", linewidth = 0.22) +
+  ggplot2::geom_text(
+    ggplot2::aes(label = .data$p_star),
+    size = 2.55,
+    color = "black",
+    lineheight = 0.85
+  ) +
+  ggplot2::facet_grid(model ~ diversity, switch = "y") +
+  ggplot2::scale_x_discrete(labels = strip_group_prefix, position = "top") +
+  ggplot2::scale_y_discrete(labels = strip_group_prefix) +
+  ggplot2::scale_fill_gradientn(
+    colours = c("#f7fbff", "#c6dbef", "#6baed6", "#2171b5", "#08306b"),
+    na.value = "grey94",
+    name = expression(-log[10]("raw P"))
+  ) +
+  ggplot2::labs(
+    x = NULL,
+    y = NULL,
+    title = "Pairwise model-adjusted raw P-value significance across longitudinal groups",
+    subtitle = paste0(
+      "Stars indicate nominal raw P values from emmeans pairwise contrasts ",
+      "(* P<0.05, ** P<0.01, *** P<0.001); P>=0.05 is blank."
+    )
+  ) +
+  ggplot2::theme_classic(base_size = 9) +
+  ggplot2::theme(
+    plot.title = ggplot2::element_text(face = "bold", size = 13),
+    plot.subtitle = ggplot2::element_text(size = 9),
+    axis.text.x = ggplot2::element_text(angle = 45, hjust = 0, vjust = 0.5, size = 6.5),
+    axis.text.y = ggplot2::element_text(size = 6.5),
+    axis.ticks = ggplot2::element_blank(),
+    strip.background = ggplot2::element_rect(fill = "grey92", color = "grey75", linewidth = 0.3),
+    strip.text.x = ggplot2::element_text(face = "bold", size = 9),
+    strip.text.y.left = ggplot2::element_text(face = "bold", angle = 0, size = 8),
+    panel.spacing.x = grid::unit(0.55, "lines"),
+    panel.spacing.y = grid::unit(0.35, "lines"),
+    legend.position = "bottom",
+    legend.key.width = grid::unit(2.2, "cm"),
+    plot.margin = ggplot2::margin(8, 8, 8, 8)
+  ) +
+  ggplot2::coord_fixed()
+
+pdf_file <- file.path(
+  figure_dir,
+  "supp_pairwise_raw_pvalue_star_heatmap_6x3.pdf"
+)
+ggplot2::ggsave(
+  pdf_file,
+  p_heatmap_star,
+  width = 15.5,
+  height = 22,
+  device = "pdf"
+)
+
+p_heatmap_star
+```
+
+# 4. Reproducibility record
+
+```{r session-info}
+sessionInfo()
+```
